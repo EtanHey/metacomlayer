@@ -49,21 +49,34 @@ export class McplayerError extends Error {
   }
 }
 
+/**
+ * Reserved error codes, pinned to mcplayer PROTOCOL.md v0 for cross-language
+ * parser stability. A contained QUEUE-PLANE fault uses the standard JSON-RPC
+ * `-32603` (internal error) — NOT an invented code — so the mock and the real
+ * daemon agree (resolves the prior mock-only `-32500` divergence; keeps the
+ * MockMcplayer→RealMcplayer swap truly zero-change).
+ */
 export const MCPLAYER_ERR = {
   UNKNOWN_SESSION: -32001,
   UNKNOWN_CHANNEL: -32002,
   ENGINE_NOT_UP: -32003,
   WAL_FULL: -32004,
+  QUEUE_FAULT: -32603, // standard JSON-RPC internal error; queue-plane only (A1)
 } as const;
 
 /**
- * The 5-method mcplayer surface. AMENDMENTS (locked):
+ * The 5-method mcplayer surface. AMENDMENTS (locked) + eval-gate clarifications:
  *  A1 — connect()/status() live on a plane SEPARATE from the queue; a queue
- *       fault must never break them; status() answers even while engine down.
+ *       fault (McplayerError -32603) must never break them; status() answers
+ *       even while the engine is down.
  *  A2 — publish() returns an enqueue-ack OR throws McplayerError(-32004) BUSY
- *       when the bounded WAL is full (never a silent drop). Offsets are
- *       monotonic per channel; subscribe(from_offset) resumes across an
- *       mcplayer restart, replaying un-acked messages.
+ *       when the bounded WAL is full (never a silent drop).
+ *  publish — IDEMPOTENT per (channel, message_id): reuse the SAME message_id on
+ *       retry; a re-publish returns the original offset (a fresh id = duplicate
+ *       delivery). [eval gap G2]
+ *  subscribe — `from_offset` is INCLUSIVE (delivers offset ≥ from_offset);
+ *       already-acked messages are skipped regardless. Offsets are monotonic per
+ *       channel; resumes across an engine AND an mcplayer restart. [eval gap G1]
  */
 export interface Mcplayer {
   connect(p: { client_id: string }): Promise<ConnectResult>;
