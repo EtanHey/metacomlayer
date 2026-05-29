@@ -15,7 +15,8 @@ export type EngineState = "up" | "busy" | "building" | "not-up";
 
 export interface McplayerStatus {
   state: EngineState;
-  since?: number;
+  /** ISO-8601 string from the real daemon (the mock used epoch ms); consumers don't read it. */
+  since?: number | string;
 }
 
 export interface ConnectResult {
