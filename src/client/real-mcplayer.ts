@@ -39,6 +39,7 @@ export interface RealMcplayerOptions {
 }
 
 export class RealMcplayer implements Mcplayer {
+  private static readonly MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
   private socket!: BunSocketLike;
   private buf = "";
   private nextId = 1;
@@ -96,6 +97,13 @@ export class RealMcplayer implements Mcplayer {
 
   private onData(chunk: string): void {
     this.buf += chunk;
+    if (this.buf.length > RealMcplayer.MAX_BUFFER_SIZE) {
+      this.failAll(
+        new McplayerError(-32000, "buffer overflow - no newline in 1MB"),
+      );
+      this.close();
+      return;
+    }
     let nl: number;
     while ((nl = this.buf.indexOf("\n")) >= 0) {
       const line = this.buf.slice(0, nl).trim();
@@ -114,14 +122,44 @@ export class RealMcplayer implements Mcplayer {
     };
     try {
       msg = JSON.parse(line);
-    } catch {
-      return; // ignore unparseable line (partial handled by buffer)
+    } catch (e) {
+      console.error(
+        "[RealMcplayer] unparseable line:",
+        line.slice(0, 200),
+        e,
+      );
+      return;
     }
     // server→client push: subscription delivery
     if (msg.method === "mcplayer.message" && msg.id === undefined) {
       const m = msg.params as ChannelMessage;
+      if (
+        !m ||
+        typeof m.channel !== "string" ||
+        typeof m.offset !== "number"
+      ) {
+        console.error(
+          "[RealMcplayer] malformed mcplayer.message:",
+          msg.params,
+        );
+        return;
+      }
       const handlers = this.channelHandlers.get(m.channel) ?? [];
-      for (const h of handlers) void h(m);
+      for (const h of handlers) {
+        try {
+          const result = h(m);
+          if (result instanceof Promise) {
+            result.catch((e) => {
+              console.error(
+                `[RealMcplayer] handler error on ${m.channel}:`,
+                e,
+              );
+            });
+          }
+        } catch (e) {
+          console.error(`[RealMcplayer] handler error on ${m.channel}:`, e);
+        }
+      }
       return;
     }
     // response to one of our requests
@@ -191,10 +229,12 @@ export class RealMcplayer implements Mcplayer {
     return {
       unsubscribe: () => {
         const arr = this.channelHandlers.get(p.channel) ?? [];
-        this.channelHandlers.set(
-          p.channel,
-          arr.filter((f) => f !== onMessage),
-        );
+        const filtered = arr.filter((f) => f !== onMessage);
+        if (filtered.length === 0) {
+          this.channelHandlers.delete(p.channel);
+        } else {
+          this.channelHandlers.set(p.channel, filtered);
+        }
       },
     };
   }
@@ -211,7 +251,9 @@ export class RealMcplayer implements Mcplayer {
   }
 
   close(): void {
+    if (this.closed) return;
     this.closed = true;
+    this.failAll(new McplayerError(-32000, "client closed"));
     try {
       this.socket.end();
     } catch {
