@@ -66,6 +66,17 @@ export function createMclToolset(
   const inbox = new Map<string, InboxItem[]>();
   const meta = new Map<string, InboxItem>(); // message_id -> item (for ack receipts)
   const subscribed = new Set<string>();
+  // per-channel arrival waiters — resolved the INSTANT a pushed message lands,
+  // so poll is an event-driven long-block (no busy-loop, no agent retry loop).
+  const waiters = new Map<string, Array<() => void>>();
+
+  function wake(channel: string): void {
+    const ws = waiters.get(channel);
+    if (ws && ws.length) {
+      waiters.set(channel, []);
+      for (const w of ws) w();
+    }
+  }
 
   async function ensureSubscribed(channel: string): Promise<void> {
     if (subscribed.has(channel)) return;
@@ -95,6 +106,7 @@ export function createMclToolset(
         arr.push(item);
         inbox.set(channel, arr);
         meta.set(raw.message_id, item);
+        wake(channel); // deliver-on-arrival: unblock any waiting poll immediately
       },
     );
   }
@@ -123,13 +135,26 @@ export function createMclToolset(
       };
     },
 
-    async poll({ channel, from_offset = 0, wait_ms = 2000 }) {
+    async poll({ channel, from_offset = 0, wait_ms = 30000 }) {
       await ensureSubscribed(channel);
       void from_offset; // subscription replays from 0 once; offsets are on each item
-      const deadline = Date.now() + wait_ms;
-      // return as soon as something is buffered, else wait up to wait_ms
-      while ((inbox.get(channel)?.length ?? 0) === 0 && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 50));
+      // Event-driven long-poll: if nothing is buffered, block on a promise that
+      // the push handler resolves the instant a message arrives (or wait_ms
+      // timeout). No polling interval, no CPU spin — return on arrival.
+      if ((inbox.get(channel)?.length ?? 0) === 0) {
+        await new Promise<void>((resolve) => {
+          let settled = false;
+          const fire = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve();
+          };
+          const arr = waiters.get(channel) ?? [];
+          arr.push(fire);
+          waiters.set(channel, arr);
+          const timer = setTimeout(fire, wait_ms);
+        });
       }
       const messages = inbox.get(channel) ?? [];
       inbox.set(channel, []); // drain

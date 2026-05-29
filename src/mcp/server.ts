@@ -48,7 +48,7 @@ server.tool(
 
 server.tool(
   "mcl_poll",
-  "Receive messages waiting on an MCL channel. Subscribes on first call and drains buffered messages (waits briefly for in-flight delivery). Returns sender, subject, body, message_id, correlation_id, requires_ack for each.",
+  "Receive messages on an MCL channel. This is an event-driven LONG-POLL: it BLOCKS and returns the instant a message arrives (or after wait_ms with none). Call it ONCE and wait — do NOT loop it in a busy retry cycle. Subscribes on first call; returns sender, subject, body, message_id, correlation_id, requires_ack for each.",
   {
     channel: z
       .string()
@@ -56,7 +56,9 @@ server.tool(
     wait_ms: z
       .number()
       .optional()
-      .describe("Max ms to wait for a message (default 2000)"),
+      .describe(
+        "Max ms to block waiting for a message (default 30000). Returns immediately on arrival.",
+      ),
   },
   async (args) => {
     const r = await tools.poll(args);
