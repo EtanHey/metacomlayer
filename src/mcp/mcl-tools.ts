@@ -1,5 +1,6 @@
 import { MclClient } from "../client/client";
 import { buildMessage, type MclEnvelope } from "../schema/envelope";
+import { ackChannelFor } from "../schema/channels";
 
 /**
  * mcl-tools — the agent-facing operations behind the MCL MCP server. This is the
@@ -11,13 +12,11 @@ import { buildMessage, type MclEnvelope } from "../schema/envelope";
  * channel on first poll, buffers inbound messages, and each `poll` drains what
  * arrived (waiting briefly for in-flight delivery). `ack` purges the transport
  * message AND, when the message required acknowledgement, sends the SHIP-3
- * `mcl.ack` receipt back on `channel:receipts` so the sender can reach VERIFIED.
+ * `mcl.ack` receipt back to the sender's PRIVATE ack channel (the message's
+ * reply_to) so the sender can reach VERIFIED — never a shared channel.
+ *
+ * Private-channel conventions (inbox/ack) live in ../schema/channels.
  */
-
-/** Each agent has a PRIVATE ack inbox so delivery receipts can't be stolen by
- * another consumer (mcplayer is competing-consumer per channel). The sender
- * stamps reply_to = its own ack channel; the receiver acks to that reply_to. */
-const ackChannelFor = (id: string) => `channel:ack:${id}`;
 
 export interface InboxItem {
   from: string;

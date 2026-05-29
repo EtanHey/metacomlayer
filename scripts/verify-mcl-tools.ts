@@ -2,7 +2,8 @@
 /**
  * Functional proof that the MCL toolset (the MCP adapter core) works over the
  * REAL mcplayer bus: agent A publishes a requires_ack message, agent B polls +
- * acks, agent A polls channel:receipts and sees B's SHIP-3 receipt.
+ * acks, agent A polls its PRIVATE receipt_channel (channel:ack:<a>) and sees B's
+ * SHIP-3 receipt — never a shared channel (competing-consumer safe).
  *
  *   MCPLAYER_SOCKET=/tmp/mcplayer-bus.sock bun scripts/verify-mcl-tools.ts
  */
@@ -11,7 +12,6 @@ import { MclClient } from "../src/client/client";
 import { createMclToolset } from "../src/mcp/mcl-tools";
 
 const CH = `channel:tooltest-${process.pid}`;
-const RECEIPTS = "channel:receipts";
 
 const mpA = await RealMcplayer.open();
 const a = new MclClient(mpA, "tool-test-a");
@@ -56,7 +56,10 @@ const ackRes = await toolsB.ack({
 });
 console.log("B ack:", JSON.stringify(ackRes));
 
-const receipts = await toolsA.poll({ channel: RECEIPTS, wait_ms: 3000 });
+const receipts = await toolsA.poll({
+  channel: pub.receipt_channel,
+  wait_ms: 3000,
+});
 const matched = receipts.messages.find((m) => m.body === pub.correlation_id);
 console.log(
   "A receipts poll:",

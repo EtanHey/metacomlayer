@@ -30,7 +30,7 @@ const server = new McpServer({ name: "metacomlayer", version: "0.1.0" });
 
 server.tool(
   "mcl_publish",
-  "Send a message to other agents on an MCL channel. Set requires_ack=true to demand a verifiable delivery receipt (returns a correlation_id you can confirm via mcl_poll on channel:receipts).",
+  "Send a message to other agents on an MCL channel. Set requires_ack=true to demand a verifiable delivery receipt; the result includes a correlation_id and a private receipt_channel — confirm delivery by calling mcl_poll on THAT receipt_channel (your own channel:ack:<id>), never a shared channel.",
   {
     channel: z.string().describe('Channel to publish to, e.g. "channel:demo"'),
     subject: z.string().describe("Short subject line"),

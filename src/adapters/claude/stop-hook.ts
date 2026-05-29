@@ -15,6 +15,7 @@
 import { RealMcplayer } from "../../client/real-mcplayer";
 import { MclClient } from "../../client/client";
 import { buildMessage } from "../../schema/envelope";
+import { inboxChannelFor, ackChannelFor } from "../../schema/channels";
 
 export interface DrainedMessage {
   from: string;
@@ -32,10 +33,6 @@ export interface StopHookDecision {
   decision: "block";
   reason: string;
 }
-
-/** Per-agent private channels (competing-consumer safe — see PUSH-AND-INBOX.md). */
-export const inboxChannelFor = (agentId: string) => `channel:inbox:${agentId}`;
-export const ackChannelFor = (agentId: string) => `channel:ack:${agentId}`;
 
 /**
  * Pure: drained inbox messages → the Stop-hook decision. Empty inbox → null
