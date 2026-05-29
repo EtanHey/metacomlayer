@@ -3,6 +3,7 @@ import {
   type Mcplayer,
   type ChannelMessage,
   type Subscription,
+  type McplayerStatus,
   McplayerError,
   MCPLAYER_ERR,
 } from "./mcplayer-interface";
@@ -81,6 +82,11 @@ export class MclClient {
 
   async ack(channel: string, message_id: string): Promise<void> {
     await this.mcplayer.ack({ channel, message_id });
+  }
+
+  /** Engine/connection health (up/busy/building/not-up). */
+  async status(p?: { engine?: string }): Promise<McplayerStatus> {
+    return this.mcplayer.status(p);
   }
 
   /** Convenience: does this message demand a receipt? (drives the SHIP-3 layer) */
