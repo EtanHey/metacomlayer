@@ -11,11 +11,11 @@ mcplayer delivers each message on a channel to **whichever subscriber consumes i
 
 ## The primitive: per-agent private channels
 
-Each agent owns two private channels (only that agent — or its push daemon — consumes them):
+Each agent owns two private channels (only that agent — or its out-of-band adapter — consumes them):
 
 | Channel | Convention | Who reads it | Purpose |
 |---------|-----------|--------------|---------|
-| **inbox** | `channel:inbox:<agentId>` | only `<agentId>` (or its push daemon) | directed messages TO this agent |
+| **inbox** | `channel:inbox:<agentId>` | only `<agentId>` (or its out-of-band adapter) | directed messages TO this agent |
 | **ack** | `channel:ack:<agentId>` | only `<agentId>` | SHIP-3 receipts for messages this agent SENT |
 
 A sender stamps `headers.reply_to = channel:ack:<sender>` on every `requires_ack` message; the receiver sends its ack to that `reply_to`. `mcl_publish` returns the `receipt_channel` so the sender knows where to confirm delivery. **Directed messaging never touches a shared channel → no contention.**
@@ -28,22 +28,51 @@ A sender stamps `headers.reply_to = channel:ack:<sender>` on every `requires_ack
 - If the inbox is empty, poll **blocks on a promise** that the push handler resolves the **instant** a message lands (or after `wait_ms`, default 30s). No polling interval, no CPU spin.
 - **Agents call `mcl_poll` once and wait** — they must NOT loop it. The tool description says so.
 
-## True async push: the injection daemon
+## True async push: OUT-OF-BAND, channels-per-harness
 
-LLM agents are request/response — they can't be interrupted mid-thought. So "push" = event-driven delivery **+ adapter-side injection**: a daemon owns the agent's inbox subscription and, on arrival, **injects** the message into the agent's session so it's *handed* the message instead of asking for it.
+LLM agents are request/response — they can't be interrupted mid-thought. "Push" therefore means: the bus delivers on arrival (event-driven, above) **and** the vendor adapter surfaces the message **out-of-band** — as a channel/sidebar event the harness renders, **never** typed into the agent's input line.
 
-```sh
-MCPLAYER_SOCKET=/tmp/mcplayer-bus.sock bun scripts/mcl-push-daemon.ts <agentId> <surface>
-# e.g. … agent-a surface:154
+> ⛔ **Rejected mechanism (do not revive):** an earlier `scripts/mcl-push-daemon.ts` "pushed" via `cmux send` / `send-key`, typing the message into the agent's TUI input line (`❯`). That is the exact stdin/PTY keystroke-injection anti-pattern MCL exists to replace — it's in-band and interrupts the prompt. A 5-message burst proved it broken (out of order, concatenated). The file is quarantined under `scripts/experimental/` with a BROKEN banner, kept only as reference for the bus-side wiring (subscribe → ack → reply_to receipt). **Do not ship any input-line injection.**
+
+**The standard:** agents communicate over CHANNELS; each harness uses its NATIVE turn-boundary mechanism, but all messages are standardized on one MCL envelope (one format + per-vendor adapters):
+
+| Harness | Native channel | Adapter | Status |
+|---------|----------------|---------|--------|
+| **Claude Code** | **Stop hook** → `{"decision":"block","reason":<message>}` feeds the message into the agent's NEXT turn, out-of-band | `src/adapters/claude/stop-hook.ts` | ✅ verified live |
+| Codex | `app-server` turn-boundary equivalent | _(planned)_ | |
+| Cursor / Gemini | vendor turn-boundary equivalent | _(planned)_ | |
+
+### Claude Code: the Stop-hook push (the verified mechanism)
+
+A request/response LLM can't be interrupted mid-thought, so the only place to hand it a message out-of-band is the **turn boundary**. Claude Code's **Stop hook** runs there. The MCL drainer (`stop-hook.ts`) is wired as that hook; on each turn boundary it:
+
+1. drains the agent's private inbox `channel:inbox:<agentId>` straight off the mcplayer bus (`from_offset:0` replays un-acked backlog);
+2. sends the SHIP-3 receipt to each message's `reply_to` (so the sender reaches VERIFIED) and acks the bus message so it isn't re-delivered;
+3. if mail was waiting, prints `{"decision":"block","reason":"📨 MCL inbox push …"}` → Claude does **not** stop; it feeds `reason` into the agent's next turn. The agent acts on a message it **never polled for**, and the text **never touches the input line**.
+4. **Burst-safe:** messages are delivered **oldest-first by offset**, batched into one hand-off (fixes the reorder/concat bug the rejected daemon hit).
+5. **Fail-safe:** bus unreachable or misconfigured → the hook allows the stop; the agent never wedges. **At-least-once:** a message is acked only after it's been handed off.
+
+Wire it as a per-agent Stop hook in the agent's `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [ {
+        "type": "command",
+        "command": "MCPLAYER_SOCKET=/tmp/mcplayer-bus.sock MCL_AGENT_ID=<agentId> bun /ABS/PATH/metacomlayer/src/adapters/claude/stop-hook.ts"
+      } ] }
+    ]
+  }
+}
 ```
 
-- Subscribes to `channel:inbox:<agentId>` (event-driven). The agent itself never polls.
-- On each message: `cmux send --surface <surface> "[MCL push] …"` + `send-key return` → the message appears in the agent's pane and it reacts.
-- **At-least-once:** only acks + sends the receipt when injection **succeeds** (cmux exit 0). If the surface is dead, it leaves the message UNacked for redelivery — never a silent drop.
-- Transport stays the durable mcplayer bus; injection is only the last-mile render.
+(`MCL_AGENT_ID` = this agent's id; `MCPLAYER_SOCKET` = the bus; optional `MCL_DRAIN_MS`, default 700, is the backlog-replay window.) A copy-paste template lives at `docs/examples/claude-stop-hook.settings.json`.
 
-**Verified on the real bus:** a message published to `channel:inbox:agent-a` was injected into the live agent-A pane; agent-A received it with no `mcl_poll` call and replied via its MCL tools.
+> **Future option (not shipped):** Claude Code may later expose a native `claude/channel` MCP notification (`notifications/claude/channel`, cf. cmuxlayer PR #8). On Claude Code 2.1.157 there is **no `--channels`** and the experimental capability does not reach the agent's turn, so the Stop hook is the channel today. The `ClaudeChannelMessage` shape in `src/adapters/translate.ts` is kept for that future only. We ship **one** Claude delivery channel — the Stop hook.
+
+This still reuses the durable mcplayer bus + per-agent private channels; nothing new is invented.
 
 ## For other layers (BrainLayer, VoiceLayer) stacking on mcplayer
 
-Use per-recipient inbox channels + per-sender ack channels. Never a shared channel for directed traffic. Reuse `channel:inbox:<id>` / `channel:ack:<id>` (or run a push daemon per consumer).
+Use per-recipient inbox channels + per-sender ack channels. Never a shared channel for directed traffic. Reuse `channel:inbox:<id>` / `channel:ack:<id>`, and surface arrivals out-of-band via the harness's native channel adapter (never input-line injection).

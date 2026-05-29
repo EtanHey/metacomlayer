@@ -9,7 +9,10 @@ import type { MclEnvelope } from "../schema/envelope";
  * regardless of cosmetic field renames.
  */
 
-/** Claude Code ⟸ `claude/channel` MCP notification (mcp.notification primitive). */
+/**
+ * Claude Code ⟸ `claude/channel` MCP notification shape. FUTURE-ONLY: kept for
+ * when Claude Code ships `--channels`. The LIVE Claude push is the Stop hook
+ * (`src/adapters/claude/stop-hook.ts`), not this notification. */
 export interface ClaudeChannelMessage {
   method: "notifications/channel/message";
   params: {

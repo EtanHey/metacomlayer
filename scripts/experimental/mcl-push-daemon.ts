@@ -1,5 +1,21 @@
 #!/usr/bin/env bun
 /**
+ * ⛔ BROKEN MECHANISM — INPUT-JAMMING. DO NOT USE. DO NOT SHIP. ⛔
+ * ---------------------------------------------------------------------------
+ * RETRACTED 2026-05-30. This daemon "pushes" by calling `cmux send` / `send-key`,
+ * which types the message into the agent's TUI INPUT LINE (the `❯` prompt). That
+ * is the exact stdin/PTY keystroke-injection anti-pattern MCL exists to REPLACE:
+ * delivery is IN-BAND and interrupts the prompt. A 5-message burst proved it
+ * (arrived #4,#3,#5,#2,#1, concatenated into one line with stray keystrokes).
+ *
+ * The serialized-queue rewrite below fixes the ORDER/concatenation SYMPTOMS, but
+ * the MECHANISM is still wrong (still typing into the input line). Kept ONLY as
+ * reference for the bus-side wiring (subscribe → ack → reply_to receipt).
+ *
+ * The real push is OUT-OF-BAND, channels-per-harness on the OpenAI-SDK envelope
+ * (see docs/PUSH-AND-INBOX.md and src/mcp/claude-channel.ts). Do not revive this.
+ * ---------------------------------------------------------------------------
+ *
  * mcl-push-daemon — TRUE async push for a request/response LLM agent.
  *
  * An LLM agent can't be interrupted mid-thought, so "push" = the bus delivers on
@@ -15,7 +31,7 @@
  */
 import { RealMcplayer } from "../src/client/real-mcplayer";
 import { MclClient } from "../src/client/client";
-import { buildMessage } from "../src/schema/envelope";
+import { buildMessage, type MclEnvelope } from "../src/schema/envelope";
 
 const agentId = process.argv[2];
 const surface = process.argv[3];
@@ -43,37 +59,44 @@ console.log(
   `MCL_PUSH_DAEMON listening inbox=${INBOX} → injecting into ${surface}`,
 );
 
-await client.receive(INBOX, async ({ envelope, raw }) => {
+// SERIALIZED, ORDERED injection. The receive handler ONLY enqueues (preserving
+// arrival order); a single worker drains the queue one message at a time,
+// awaiting each send+return fully (plus a settle gap) before the next. A burst
+// therefore arrives IN ORDER as DISTINCT submits — never concatenated or
+// interleaved (the bug a 5-message burst exposed when handlers ran concurrently).
+type Item = {
+  envelope: MclEnvelope;
+  raw: { message_id: string; offset: number };
+};
+const queue: Item[] = [];
+let draining = false;
+
+async function inject(item: Item): Promise<void> {
+  const { envelope, raw } = item;
   const from = envelope.params.routing.sender.id;
   const body = envelope.params.payload.body;
-  const subject = envelope.params.payload.subject;
   const cid = envelope.params.headers.correlation_id;
   const requires_ack = envelope.params.delivery_control.requires_ack;
-  console.log(
-    `[${stamp()}] push ← ${from}: ${subject} → injecting into ${surface}`,
-  );
-
-  // INJECT into the agent's session (last-mile render; transport was the bus)
   const text =
-    `[MCL push] Message from ${from} on your inbox: "${body}"` +
-    (requires_ack
-      ? `  (reply/ack via your mcl tools; correlation ${cid})`
-      : "");
+    `[MCL push] from ${from}: "${body}"` +
+    (requires_ack ? ` (ack via your mcl tools; correlation ${cid})` : "");
+
   const sendCode = await cmux(["send", "--surface", surface, text]);
   const keyCode =
     sendCode === 0
       ? await cmux(["send-key", "--surface", surface, "return"])
       : sendCode;
   if (sendCode !== 0 || keyCode !== 0) {
-    // injection FAILED (e.g. surface closed) — do NOT ack, so the message stays
-    // in the WAL and is redelivered to a future subscriber (at-least-once).
+    // injection FAILED (e.g. surface closed) — do NOT ack; the WAL redelivers it.
     console.error(
-      `[${stamp()}] ✗ inject FAILED into ${surface} (send=${sendCode} key=${keyCode}) — leaving message UNacked for redelivery`,
+      `[${stamp()}] ✗ inject FAILED into ${surface} (send=${sendCode} key=${keyCode}) — UNacked for redelivery`,
     );
     return;
   }
+  console.log(
+    `[${stamp()}] ✓ injected #${raw.offset} from ${from} → ${surface}`,
+  );
 
-  // delivered: ack the transport message + fire the SHIP-3 receipt to reply_to
   await client.ack(INBOX, raw.message_id);
   const reply_to = envelope.params.headers.reply_to;
   if (requires_ack && cid && reply_to) {
@@ -88,8 +111,24 @@ await client.receive(INBOX, async ({ envelope, raw }) => {
     });
     receipt.params.headers.correlation_id = cid;
     await client.send(receipt);
-    console.log(`[${stamp()}] receipt → ${reply_to} (correlation ${cid})`);
   }
+}
+
+async function drain(): Promise<void> {
+  if (draining) return;
+  draining = true;
+  while (queue.length) {
+    await inject(queue.shift()!);
+    // settle: let the PTY consume this submit before the next so a rapid burst
+    // doesn't merge into one input line.
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  draining = false;
+}
+
+await client.receive(INBOX, ({ envelope, raw }) => {
+  queue.push({ envelope, raw }); // enqueue in arrival order
+  void drain();
 });
 
 // run until killed

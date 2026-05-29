@@ -3,8 +3,11 @@ import type { MclEnvelope } from "../schema/envelope";
 /**
  * mcl-adapters — per-vendor connectivity. An adapter translates the canonical
  * envelope to/from ONE agent CLI's real ingress, so the rest of MCL never
- * touches vendor wire formats. Per the DECISION:
- *   - Claude Code: native `claude/channel` MCP (NOT lifecycle hooks).
+ * touches vendor wire formats. Per the (CORRECTED 2026-05-30) DECISION:
+ *   - Claude Code: the STOP HOOK is the verified out-of-band push channel
+ *     (`src/adapters/claude/stop-hook.ts`). The earlier `claude/channel` MCP
+ *     note was premature — Claude Code 2.1.157 has no `--channels`, so that
+ *     notification never reaches the agent's turn; it's future-only.
  *   - Codex CLI:   WebSocket JSON-RPC 2.0 to the `codex app-server` daemon.
  *   - Cursor CLI:  headless `--resume … --output-format stream-json` capture.
  *

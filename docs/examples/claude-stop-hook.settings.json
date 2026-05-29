@@ -1,0 +1,15 @@
+{
+  "_comment": "MCL Claude push adapter — drop into an agent's .claude/settings.json. Replace <agentId> with this agent's MCL id and the ABS path with your metacomlayer checkout. The Stop hook drains channel:inbox:<agentId> at each turn boundary and delivers any waiting MCL messages out-of-band via {decision:block,reason} (never the input line). MCL_DRAIN_MS (default 700) is the backlog-replay window.",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MCPLAYER_SOCKET=/tmp/mcplayer-bus.sock MCL_AGENT_ID=<agentId> bun /ABS/PATH/metacomlayer/src/adapters/claude/stop-hook.ts"
+          }
+        ]
+      }
+    ]
+  }
+}
