@@ -1,361 +1,421 @@
-# Code Review: P3 mcl-adapters + P4 mcl-receipts
+# 🤖 Bugbot Review: RealMcplayer Client
 
-**Reviewer:** Cursor Bugbot  
-**Date:** 2026-05-29  
-**Commit:** ede193c  
-**Status:** ✅ **APPROVED** with minor suggestions
-
----
-
-## Executive Summary
-
-The implementation of P3 (`mcl-adapters`) and P4 (`mcl-receipts`) is **solid and production-ready** with the following strengths:
-
-- ✅ **All 19 tests pass** with comprehensive coverage
-- ✅ **Zero TypeScript errors** with strict mode enabled
-- ✅ **Clean architecture** with proper separation of concerns
-- ✅ **Robust error handling** for backpressure and DLQ scenarios
-- ✅ **JSON-RPC 2.0 discipline** correctly enforced
-- ✅ **No breaking changes** to the locked mcplayer 5-method contract
-
-The code is well-tested, type-safe, and ready for the next integration phase (live mcplayer + real CLI wiring).
+**PR:** `feat/real-mcplayer-client` — RealMcplayer zero-MCL-change UDS/NDJSON swap  
+**Status:** ✅ 24 tests pass, 0 type errors  
+**Reviewed:** 2026-05-29
 
 ---
 
-## Detailed Findings
+## Summary
 
-### 🟢 Strengths
+The implementation is **solid and production-ready** with excellent test coverage. The core protocol implementation is correct, and the zero-MCL-change promise holds. However, there are **7 production-critical issues** and **5 test/maintainability improvements** that should be addressed before merging.
 
-#### 1. **Strong Type Safety**
-- Zod schemas provide runtime validation at typed boundaries
-- Strict TypeScript config (`noUncheckedIndexedAccess`, `strict: true`)
-- Proper use of type guards (`isRequest()`)
-- No `any` types or unsafe casts
-
-#### 2. **Excellent Test Coverage**
-- **19 tests** covering core flows:
-  - Pure translation functions preserve `correlation_id` and body
-  - End-to-end SHIP-3 loop (send → mcplayer → adapter → ACK → VERIFIED)
-  - DLQ exhaustion + negative-ack behavior
-  - Fire-and-forget notifications
-  - Backpressure (BUSY nack) handling
-  - Two-plane stability (connection vs queue)
-  - Resume after restart with monotonic offsets
-
-#### 3. **Robust Error Handling**
-- Backpressure properly surfaced (never silently dropped)
-- DLQ with best-effort negative-ack to `reply_to`
-- Graceful handling of missing adapters (throws clear error)
-- Queue fault isolation (doesn't break connection plane)
-
-#### 4. **Clean Separation of Concerns**
-- **Adapters**: pure translation (no I/O in translate.ts)
-- **Receipts**: state machine logic, I/O injected via client
-- **Client**: thin layer over mcplayer contract
-- **Schema**: canonical envelope with enforced invariants
-
-#### 5. **JSON-RPC 2.0 Discipline**
-- `requires_ack: true` → Request (has `id` + `correlation_id`)
-- `requires_ack: false` → Notification (no `id`, strict schema rejects extras)
-- Enforced in `buildMessage()` and validated in tests
+**Severity:**
+- 🔴 **Critical (3)** — memory leaks, unbounded buffer growth, silent handler failures
+- 🟡 **High (4)** — error visibility, resource cleanup, type safety
+- 🟢 **Medium (5)** — test isolation, code quality
 
 ---
 
-### 🟡 Minor Issues & Suggestions
+## 🔴 Critical Issues
 
-#### Issue #1: Missing Error Handling in LoopbackAdapter.pushInbound
-
-**Location:** `src/adapters/adapter.ts:73-75`
+### 1. **Unbounded buffer growth (DoS vector)**
+**File:** `src/client/real-mcplayer.ts:97-105`  
+**Severity:** 🔴 Critical
 
 ```typescript
-async pushInbound(env: MclEnvelope): Promise<void> {
-  for (const h of this.inboundHandlers) await h(env);
-}
-```
-
-**Issue:** If any handler throws, subsequent handlers won't run.
-
-**Recommendation:** Wrap in try-catch or use `Promise.allSettled()` for parallel execution with fault isolation.
-
-**Suggested fix:**
-```typescript
-async pushInbound(env: MclEnvelope): Promise<void> {
-  const results = await Promise.allSettled(
-    this.inboundHandlers.map(h => h(env))
-  );
-  const failures = results.filter(r => r.status === 'rejected');
-  if (failures.length > 0) {
-    console.warn(`${failures.length} inbound handlers failed:`, failures);
+private onData(chunk: string): void {
+  this.buf += chunk;  // ← NO SIZE LIMIT
+  let nl: number;
+  while ((nl = this.buf.indexOf("\n")) >= 0) {
+    const line = this.buf.slice(0, nl).trim();
+    this.buf = this.buf.slice(nl + 1);
+    if (line) this.dispatch(line);
   }
 }
 ```
 
-**Severity:** Low (only affects test adapter)
+**Issue:** If a malicious or broken server sends data without newlines, `this.buf` grows unbounded, leading to memory exhaustion.
 
----
+**Impact:** Denial of service; production daemon bugs could crash MCL clients.
 
-#### Issue #2: Potential Race Condition in ReceiptTracker.onAck
-
-**Location:** `src/receipts/receipts.ts:101-111`
-
+**Fix:**
 ```typescript
-async onAck(ack: MclEnvelope): Promise<void> {
-  const cid = ack.params.headers.correlation_id;
-  if (!cid) return;
-  const rec = this.records.get(cid);
-  if (!rec || rec.state === "dlq") return;
-  rec.ackedBy.add(ack.params.routing.sender.id);
-  const allAcked =
-    rec.expectAcksFrom.length > 0 &&
-    rec.expectAcksFrom.every((owner) => rec.ackedBy.has(owner));
-  if (allAcked) rec.state = "verified";
+private static readonly MAX_BUFFER_SIZE = 1024 * 1024; // 1MB
+
+private onData(chunk: string): void {
+  this.buf += chunk;
+  if (this.buf.length > RealMcplayer.MAX_BUFFER_SIZE) {
+    this.failAll(new McplayerError(-32000, "buffer overflow - no newline in 1MB"));
+    this.close();
+    return;
+  }
+  // ... rest unchanged
 }
 ```
 
-**Issue:** If multiple ACKs arrive concurrently and `attempt()` is retrying, the record state could be mutated while being read.
+---
 
-**Recommendation:** Consider making state transitions atomic or adding a mutex if production workload shows concurrency issues. Current implementation is fine for single-threaded Node.js event loop.
+### 2. **Silent handler failures — swallowed exceptions**
+**File:** `src/client/real-mcplayer.ts:121-125`  
+**Severity:** 🔴 Critical
 
-**Severity:** Very Low (unlikely in practice due to single-threaded execution)
+```typescript
+if (msg.method === "mcplayer.message" && msg.id === undefined) {
+  const m = msg.params as ChannelMessage;
+  const handlers = this.channelHandlers.get(m.channel) ?? [];
+  for (const h of handlers) void h(m);  // ← thrown errors disappear
+  return;
+}
+```
+
+**Issue:** If a subscription handler throws (e.g., schema validation fails, business logic bug), the exception is silently swallowed by `void`. Other handlers on the same channel never run, and the caller has no visibility.
+
+**Impact:** Silent data loss; debugging production issues requires attaching a debugger.
+
+**Fix:**
+```typescript
+for (const h of handlers) {
+  try {
+    const result = h(m);
+    if (result instanceof Promise) {
+      result.catch(e => {
+        // emit to error channel or log; don't let one bad handler break others
+        console.error(`[RealMcplayer] handler error on ${m.channel}:`, e);
+      });
+    }
+  } catch (e) {
+    console.error(`[RealMcplayer] handler error on ${m.channel}:`, e);
+  }
+}
+```
 
 ---
 
-#### Issue #3: DLQ Negative-Ack Swallows All Errors
+### 3. **Memory leak: channelHandlers never cleaned up**
+**File:** `src/client/real-mcplayer.ts:192-198`  
+**Severity:** 🔴 Critical
 
-**Location:** `src/receipts/receipts.ts:156-172`
+```typescript
+unsubscribe: () => {
+  const arr = this.channelHandlers.get(p.channel) ?? [];
+  this.channelHandlers.set(
+    p.channel,
+    arr.filter((f) => f !== onMessage),
+  );
+}
+```
+
+**Issue:** 
+1. If `subscribe()` is called with the same `onMessage` reference multiple times, only **one** instance is removed per `unsubscribe()`.
+2. Empty arrays remain in the Map forever — channels never get deleted even after all subscribers leave.
+
+**Impact:** Long-running processes (orchestrators) that dynamically subscribe/unsubscribe will accumulate empty Map entries and stale handlers.
+
+**Fix:**
+```typescript
+unsubscribe: () => {
+  const arr = this.channelHandlers.get(p.channel) ?? [];
+  const filtered = arr.filter((f) => f !== onMessage);
+  if (filtered.length === 0) {
+    this.channelHandlers.delete(p.channel);  // clean up empty channels
+  } else {
+    this.channelHandlers.set(p.channel, filtered);
+  }
+}
+```
+
+For the duplicate-subscribe issue, either:
+- **Document** that re-subscribing with the same handler adds it multiple times (user responsibility)
+- **Dedupe** on subscribe: `if (!list.includes(onMessage)) list.push(onMessage);`
+
+---
+
+## 🟡 High Priority
+
+### 4. **No type validation on `mcplayer.message` params**
+**File:** `src/client/real-mcplayer.ts:122`  
+**Severity:** 🟡 High
+
+```typescript
+const m = msg.params as ChannelMessage;
+```
+
+**Issue:** No runtime validation that `params` contains `{ channel, message_id, payload, offset }`. If the daemon sends a malformed notification, downstream handlers crash with `undefined` access.
+
+**Impact:** Fragile cross-system boundary; protocol version mismatches cause runtime errors instead of early rejections.
+
+**Fix:**
+```typescript
+const m = msg.params as ChannelMessage;
+if (!m || typeof m.channel !== 'string' || typeof m.offset !== 'number') {
+  console.error('[RealMcplayer] malformed mcplayer.message:', msg.params);
+  return; // skip malformed notifications
+}
+```
+
+Or add Zod validation (mcl-schema already uses Zod).
+
+---
+
+### 5. **Silent JSON parse failures**
+**File:** `src/client/real-mcplayer.ts:115-119`  
+**Severity:** 🟡 High
 
 ```typescript
 try {
-  // ... build and send nack ...
-  await this.client.send(nack);
+  msg = JSON.parse(line);
 } catch {
-  /* originator unreachable too — record stays dlq for the host to inspect */
+  return; // ignore unparseable line (partial handled by buffer)
 }
 ```
 
-**Issue:** Empty catch block makes debugging hard. The comment explains intent, but no logging.
+**Issue:** Parse errors are silently swallowed. Debugging "message never arrived" issues is impossible without logging.
 
-**Recommendation:** Add structured logging for observability:
+**Impact:** Production incidents require packet captures; no local diagnostics.
+
+**Fix:**
 ```typescript
-} catch (err) {
-  // Originator unreachable; DLQ record preserved for inspection
-  console.warn(`Failed to send negative-ack for ${rec.correlation_id}:`, err);
+} catch (e) {
+  console.error('[RealMcplayer] unparseable line:', line.slice(0, 200), e);
+  return;
 }
 ```
 
-**Severity:** Low (acceptable design choice, but logging would help production debugging)
-
 ---
 
-#### Issue #4: Missing Validation for Empty expectAcksFrom
-
-**Location:** `src/receipts/receipts.ts:107-110`
+### 6. **Pending requests not failed immediately on close()**
+**File:** `src/client/real-mcplayer.ts:213-220`  
+**Severity:** 🟡 High
 
 ```typescript
-const allAcked =
-  rec.expectAcksFrom.length > 0 &&
-  rec.expectAcksFrom.every((owner) => rec.ackedBy.has(owner));
-if (allAcked) rec.state = "verified";
-```
-
-**Issue:** If `expectAcksFrom` is empty, `allAcked` is always `false` and the receipt never verifies. This is correct behavior but could be confusing.
-
-**Recommendation:** Consider warning or throwing at `registerSend` if `requires_ack: true` but `expectAcksFrom` is empty:
-```typescript
-if (envelope.params.delivery_control.requires_ack && p.expectAcksFrom?.length === 0) {
-  throw new Error("requires_ack messages must specify expectAcksFrom");
+close(): void {
+  this.closed = true;
+  try {
+    this.socket.end();
+  } catch {
+    /* already closed */
+  }
 }
 ```
 
-**Severity:** Low (current behavior is safe, just not obvious)
+**Issue:** `close()` sets `this.closed = true` and ends the socket, but doesn't call `failAll()` immediately. Pending requests wait for the socket `close` event to fire, which may be delayed or never happen if `socket.end()` throws.
 
----
+**Impact:** Graceful shutdown leaves promises hanging; tests may timeout.
 
-#### Issue #5: Vendor Type Not Extensible
-
-**Location:** `src/adapters/adapter.ts:16`
-
+**Fix:**
 ```typescript
-export type Vendor = "claude" | "codex" | "cursor";
+close(): void {
+  if (this.closed) return;
+  this.closed = true;
+  this.failAll(new McplayerError(-32000, "client closed"));
+  try {
+    this.socket.end();
+  } catch {
+    /* already closed */
+  }
+}
 ```
 
-**Issue:** If new vendors are added later, this string union requires code changes everywhere.
+---
 
-**Recommendation:** Consider making it extensible:
+### 7. **Type inconsistency: `McplayerStatus.since`**
+**File:** `src/client/mcplayer-interface.ts:18-19`  
+**Severity:** 🟡 High (maintainability)
+
 ```typescript
-export type Vendor = "claude" | "codex" | "cursor" | (string & {});
+/** ISO-8601 string from the real daemon (the mock used epoch ms); consumers don't read it. */
+since?: number | string;
 ```
-Or use a registry pattern where vendors can register themselves.
 
-**Severity:** Very Low (acceptable for the current phase; revisit when adding more vendors)
+**Issue:** The comment says "consumers don't read it," but the type is exposed in the interface. If it's truly unused, it should be removed or marked `@internal`. If it's used, the inconsistency (mock = number, real = string) is a landmine.
 
----
+**Impact:** Future consumers will hit runtime type errors if they assume `number` (from mock tests) then run against real daemon.
 
-### 🔵 Observations (Not Issues)
-
-1. **MockMcplayer Complexity:** The mock is quite sophisticated (two-plane separation, bounded WAL, offset monotonicity). This is **good** — it accurately models the real contract and catches integration bugs early.
-
-2. **No Logging/Observability:** The code has no structured logging. For production, consider adding correlation-id-tagged logs at state transitions (enqueued → heads_up → verified).
-
-3. **No Metrics/Telemetry:** Consider instrumenting:
-   - Receipt state distribution (pending/verified/dlq counts)
-   - Adapter delivery latency
-   - DLQ size over time
-
-4. **Notifier Interface:** The `headsUp()` notifier is fire-and-forget. If the UI layer throws, it won't block delivery (good design).
-
-5. **Correlation ID as String:** UUIDs are used as `correlation_id`. Consider a typed `CorrelationId` brand if you want to enforce format (e.g., prevent empty strings).
+**Recommendation:**
+- If unused: remove from interface entirely
+- If needed: standardize to `string` (ISO-8601) and fix mock to match
+- If compatibility required: document the exact contract in JSDoc
 
 ---
 
-### 🟢 What's Working Well
+## 🟢 Medium Priority (Test Quality)
 
-1. **Pure Translation Functions:** `toClaudeChannel`, `toCodexRpc`, `fromCursorStreamJson` are **pure** (no side effects), making them easy to test and reason about.
+### 8. **Test global state prevents isolation**
+**File:** `src/client/real-mcplayer.test.ts:29-34`  
+**Severity:** 🟢 Medium
 
-2. **Idempotency:** `MockMcplayer.publish()` correctly deduplicates by `message_id`, preventing double-delivery.
+```typescript
+let server: { stop: () => void };
+const channels = new Map<string, Chan>();
+let capacity = 1024;
+const bufs = new WeakMap<object, string>();
+const subscribers = new Map<string, Set<{ write: (s: string) => void }>>();
+```
 
-3. **Backpressure Propagation:** `Backpressure` exception correctly surfaces BUSY nacks (-32004) to the caller, never silently dropping.
+**Issue:** Global mutable state shared across all tests. One test can pollute another (e.g., `capacity` mutation on line 217).
 
-4. **Resume After Restart:** `MockMcplayer.snapshot()` + offset-based resume proves durability across restarts.
+**Impact:** Flaky tests; false positives/negatives; hard to run tests in parallel.
 
-5. **End-to-End Test:** The full loop test in `adapters.test.ts` is **excellent** — it validates that all components compose correctly.
-
----
-
-## Security Review
-
-✅ **No Critical Security Issues Found**
-
-### Secure Practices Observed:
-- ✅ Input validation via Zod schemas at typed boundaries
-- ✅ No SQL injection risk (no DB yet)
-- ✅ No XSS risk (no HTML rendering)
-- ✅ UDS-only transport (no network exposure)
-- ✅ No hardcoded secrets or credentials
-
-### Recommendations:
-1. **Namespace Identity Validation:** When wiring real adapters, add validation to prevent agent impersonation (e.g., verify `sender.id` matches the authenticated connection).
-2. **Rate Limiting:** Consider per-channel publish rate limits to prevent abuse (especially on shared channels like `channel:all`).
-3. **Correlation ID Entropy:** Ensure UUIDs are generated with crypto-secure RNG (current `crypto.randomUUID()` is good).
+**Fix:** Move state into `beforeEach`, or clear state after each test:
+```typescript
+beforeEach(() => {
+  channels.clear();
+  subscribers.clear();
+  capacity = 1024;
+});
+```
 
 ---
 
-## Performance Review
+### 9. **Fragile global capacity mutation**
+**File:** `src/client/real-mcplayer.test.ts:216-224`
 
-✅ **No Performance Bottlenecks Identified**
+```typescript
+test("a -32004 BUSY nack surfaces as McplayerError", async () => {
+  capacity = 1;  // ← mutates global
+  const mp = await RealMcplayer.open({ socketPath: SOCK });
+  await mp.publish({ channel: "channel:busy", message_id: "b1", payload: 1 });
+  await expect(
+    mp.publish({ channel: "channel:busy", message_id: "b2", payload: 2 }),
+  ).rejects.toBeInstanceOf(McplayerError);
+  capacity = 1024;  // ← if test throws before this, capacity stays 1
+  mp.close();
+});
+```
 
-### Efficient Patterns:
-- ✅ Map-based lookups (`O(1)` for receipt/adapter retrieval)
-- ✅ Set-based ACK tracking (`O(1)` membership checks)
-- ✅ No blocking I/O in hot paths (async/await used correctly)
+**Issue:** If the test fails before `capacity = 1024`, subsequent tests inherit `capacity = 1`.
 
-### Potential Optimizations (Future):
-1. **Receipt Cleanup:** `ReceiptTracker.records` grows unbounded. Consider TTL-based eviction for verified/dlq receipts.
-2. **Batch ACK Processing:** If many ACKs arrive simultaneously, consider batching state updates.
-3. **Subscription Filtering:** If channels have high message volume, consider server-side filtering by recipient.
+**Fix:**
+```typescript
+test("...", async () => {
+  const originalCapacity = capacity;
+  try {
+    capacity = 1;
+    // ... test body
+  } finally {
+    capacity = originalCapacity;
+  }
+});
+```
 
----
-
-## Documentation Quality
-
-✅ **Strong Documentation**
-
-- Clear module-level comments explaining purpose and design decisions
-- Good inline comments explaining non-obvious logic
-- README with status table and clear examples
-- Interface contracts well-documented (e.g., mcplayer 5-method seam)
-
-### Suggestions:
-1. Add JSDoc comments to public APIs (helps IDE autocomplete)
-2. Consider adding a sequence diagram for the SHIP-3 flow
-3. Document the state machine transitions in `receipts.ts` (enqueued → heads_up → verified → dlq)
-
----
-
-## Test Quality
-
-✅ **Excellent Test Coverage**
-
-### Strengths:
-- Tests focus on **behavior** not implementation details
-- Good use of test helpers (`headsUp()`, `ackFor()`)
-- Edge cases covered (partial ACKs, empty notifications, backpressure, DLQ)
-- End-to-end test validates full integration
-
-### Suggestions:
-1. Add property-based tests (e.g., fuzzing envelope shapes with `fast-check`)
-2. Test concurrent ACK arrival (though single-threaded makes this low priority)
-3. Add benchmark tests for high-volume scenarios (1000+ messages/sec)
+Or use `beforeEach`/`afterEach` hooks.
 
 ---
 
-## Compliance with Best Practices
+### 10. **Shared client in ZERO-MCL-CHANGE test (race condition)**
+**File:** `src/client/real-mcplayer.test.ts:227-250`
 
-✅ **TypeScript Best Practices:**
-- Strict mode enabled
-- No `any` types
-- Proper error subclassing (`Backpressure extends Error`)
-- Zod for runtime validation
+```typescript
+test("ZERO-MCL-CHANGE: MclClient works over RealMcplayer exactly as over the mock", async () => {
+  const mp = await RealMcplayer.open({ socketPath: SOCK });
+  const orc = new MclClient(mp, "orc");
+  await orc.connect();
+  // ...
+  const receiver = new MclClient(mp, "brainlayer");  // ← SAME mp
+  await receiver.receive("channel:owners", ({ envelope }) => {
+    seen.push(envelope.params.payload.body);
+  });
+  // ...
+});
+```
 
-✅ **Testing Best Practices:**
-- Arrange-Act-Assert structure
-- Descriptive test names
-- Isolated tests (no shared state)
+**Issue:** Two `MclClient` instances sharing the same `RealMcplayer`. If `MclClient` calls `mp.subscribe()` internally, both clients' handlers are registered on the same channel. Race condition on message delivery order.
 
-✅ **Architecture Best Practices:**
-- Separation of concerns (adapters, receipts, client, schema)
-- Dependency injection (mcplayer, notifier, onDlq)
-- Interface-based design (VendorAdapter, Mcplayer)
+**Impact:** Flaky test; doesn't prove isolation in multi-client scenarios.
 
----
-
-## Readiness Assessment
-
-| Criterion | Status | Notes |
-|-----------|--------|-------|
-| Tests Pass | ✅ 19/19 | All passing |
-| Type Safety | ✅ 0 errors | Strict mode, no issues |
-| Security | ✅ Pass | No critical vulnerabilities |
-| Documentation | ✅ Good | Clear and comprehensive |
-| Error Handling | ✅ Robust | Backpressure + DLQ properly handled |
-| Performance | ✅ Efficient | No bottlenecks identified |
-| Integration Ready | ⚠️ Pending | Awaiting live mcplayer + CLI wiring |
-
-**Recommendation:** ✅ **MERGE** — The code is ready for the next phase (live wiring). Address minor suggestions in follow-up PRs.
+**Recommendation:**
+- If intentional (testing shared client), add a comment explaining why.
+- Otherwise, use separate `RealMcplayer` instances.
 
 ---
 
-## Action Items (Optional, Low Priority)
+### 11. **Hard-coded 500ms wait in live-roundtrip**
+**File:** `scripts/live-roundtrip.ts:54`
 
-1. [ ] Add logging to DLQ negative-ack catch block (#3)
-2. [ ] Consider fault isolation in `LoopbackAdapter.pushInbound` (#1)
-3. [ ] Add JSDoc to public APIs
-4. [ ] Consider receipt cleanup/TTL for verified/dlq records
-5. [ ] Add namespace identity validation when wiring real adapters
+```typescript
+await new Promise((r) => setTimeout(r, 500));
+```
 
----
+**Issue:** Arbitrary delay; fails on slow CI or overloaded systems.
 
-## Final Verdict
-
-**✅ APPROVED**
-
-This is **high-quality, production-ready code** with excellent test coverage, strong type safety, and thoughtful error handling. The minor issues noted are suggestions for future improvement, not blockers.
-
-The implementation successfully delivers:
-- ✅ P3 mcl-adapters: clean vendor translation + registry + loopback testing
-- ✅ P4 mcl-receipts: SHIP-3 verifiable delivery (ACK-driven, not fake-delivery)
-- ✅ End-to-end proof that the full stack composes correctly
-- ✅ Zero changes to the locked mcplayer 5-method contract
-
-**Next Steps:**
-1. Merge this PR
-2. Wire live mcplayer UDS client (zero MCL changes expected)
-3. Wire real CLI I/O behind adapter deliver() (Claude HTTP, Codex WS, Cursor subprocess)
-4. Run cmux A2A smoke test with real agents
-
-**Risk Level:** Low — Additive changes, mock-backed, comprehensive tests, no live I/O yet.
+**Fix:** Use the same `waitFor()` pattern from the tests (poll until `got.length > 0`).
 
 ---
 
-**Reviewed by:** [Cursor Bugbot](https://cursor.com/bugbot)  
-**Commit:** ede193c94653eaae04ebd897d5d493aa9010a485
+### 12. **Generic waitFor timeout message**
+**File:** `src/client/real-mcplayer.test.ts:154`
+
+```typescript
+reject(new Error("timeout"));
+```
+
+**Issue:** When tests fail, "timeout" provides no context (what were we waiting for?).
+
+**Fix:**
+```typescript
+function waitFor(pred: () => boolean, ms = 1000, label = 'condition'): Promise<void> {
+  return new Promise((resolve, reject) => {
+    // ...
+    reject(new Error(`timeout waiting for ${label}`));
+  });
+}
+
+// usage:
+await waitFor(() => got.length >= 2, 1000, 'subscribe backlog replay');
+```
+
+---
+
+## ✅ What's Good
+
+1. **Protocol conformance is excellent** — all PROTOCOL.md v0 behaviors (idempotency, monotonic offsets, BUSY nack, notification routing) are correctly implemented.
+2. **Test coverage is comprehensive** — real socket + full request/response/notification paths exercised.
+3. **Zero-MCL-change promise holds** — `Mcplayer` interface unchanged; adapters/receipts untouched.
+4. **Error discipline** — `McplayerError` with structured codes; JSON-RPC 2.0 compliance.
+5. **Plane separation (A1) enforced** — connection methods don't touch queue state.
+6. **Idempotency on `message_id`** — correctly implemented and tested.
+
+---
+
+## Recommendations
+
+### Before Merge (Critical Path)
+1. Fix **#1 (buffer overflow)** — production DoS risk
+2. Fix **#2 (silent handler failures)** — debugging nightmare
+3. Fix **#3 (memory leak)** — long-running process killer
+
+### Before Production Deploy (High Priority)
+4. Add **#4 (type validation)** — cross-system robustness
+5. Add **#5 (parse error logging)** — incident response
+6. Fix **#6 (close() cleanup)** — graceful shutdown
+
+### Post-Merge (Improvements)
+7. Resolve **#7 (`since` type)** — interface hygiene
+8–12. Fix test isolation and polish
+
+---
+
+## Testing Verification
+
+```bash
+$ bun test
+✓ 24 tests pass (RealMcplayer conformance over real UDS)
+
+$ bun run typecheck
+✓ 0 errors
+```
+
+**Live daemon test:** ⏸️ BLOCKED (expected) — `/tmp/mcplayer.sock` not yet on NDJSON surface (D2 pending). The script correctly diagnoses this and exits with clear messaging.
+
+---
+
+## Conclusion
+
+**Ship-ready with fixes.** The core implementation is sound, and the conformance tests prove the contract. Address the 3 critical issues before merge; the rest can follow in a cleanup PR if time-constrained.
+
+**Approved pending Critical fixes** ✅🔧
+
+---
+
+_Generated by @bugbot on 2026-05-29_

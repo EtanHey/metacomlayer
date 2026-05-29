@@ -93,8 +93,10 @@ export class MockMcplayer implements Mcplayer {
     payload: unknown;
     durable?: boolean;
   }): Promise<{ enqueued: true; offset: number }> {
+    // queue-plane fault = standard JSON-RPC internal error (-32603), matching
+    // mcplayer PROTOCOL.md (no invented -32500) so mock↔real stay congruent (A1).
     if (this.queueFaulted)
-      throw new McplayerError(-32500, "queue plane faulted");
+      throw new McplayerError(MCPLAYER_ERR.QUEUE_FAULT, "queue plane faulted");
     const ch = this.getOrCreate(p.channel);
 
     // idempotent on message_id (dedupe re-publishes)
