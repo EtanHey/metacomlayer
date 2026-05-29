@@ -14,7 +14,10 @@ import { buildMessage, type MclEnvelope } from "../schema/envelope";
  * `mcl.ack` receipt back on `channel:receipts` so the sender can reach VERIFIED.
  */
 
-const RECEIPTS = "channel:receipts";
+/** Each agent has a PRIVATE ack inbox so delivery receipts can't be stolen by
+ * another consumer (mcplayer is competing-consumer per channel). The sender
+ * stamps reply_to = its own ack channel; the receiver acks to that reply_to. */
+const ackChannelFor = (id: string) => `channel:ack:${id}`;
 
 export interface InboxItem {
   from: string;
@@ -26,6 +29,7 @@ export interface InboxItem {
   correlation_id?: string;
   requires_ack: boolean;
   thread_id: string;
+  reply_to?: string;
 }
 
 export interface MclToolset {
@@ -39,6 +43,7 @@ export interface MclToolset {
     message_id: string;
     offset: number;
     correlation_id?: string;
+    receipt_channel?: string;
   }>;
   poll(args: {
     channel: string;
@@ -84,6 +89,7 @@ export function createMclToolset(
           correlation_id: envelope.params.headers.correlation_id,
           requires_ack: envelope.params.delivery_control.requires_ack,
           thread_id: envelope.params.routing.thread_id,
+          reply_to: envelope.params.headers.reply_to,
         };
         const arr = inbox.get(channel) ?? [];
         arr.push(item);
@@ -95,6 +101,7 @@ export function createMclToolset(
 
   return {
     async publish({ channel, subject, body, requires_ack = false }) {
+      const receipt_channel = ackChannelFor(selfId);
       const msg = buildMessage({
         method: requires_ack ? "mcl.headsup" : "mcl.broadcast",
         sender: { id: selfId, role: "agent" },
@@ -104,12 +111,15 @@ export function createMclToolset(
         body,
         requires_ack,
       });
+      // route any delivery receipt to OUR private ack channel (no contention)
+      msg.params.headers.reply_to = receipt_channel;
       const { offset } = await client.send(msg);
       return {
         channel,
         message_id: msg.params.routing.message_id,
         offset,
         correlation_id: msg.params.headers.correlation_id,
+        receipt_channel,
       };
     },
 
@@ -131,10 +141,13 @@ export function createMclToolset(
       const item = meta.get(message_id);
       let receipt_sent = false;
       if (item?.requires_ack && item.correlation_id) {
+        // reply to the SENDER's private ack channel (reply_to); fall back to a
+        // per-sender ack channel derived from the sender id.
+        const receiptChannel = item.reply_to ?? ackChannelFor(item.from);
         const receipt = buildMessage({
           method: "mcl.ack",
           sender: { id: selfId, role: "agent" },
-          recipient: RECEIPTS,
+          recipient: receiptChannel,
           thread_id: item.thread_id,
           subject: "ack",
           body: item.correlation_id,
