@@ -76,12 +76,18 @@ export class ReceiptTracker {
       await this.client.send(envelope); // fire-and-forget
       return;
     }
+    const expectAcksFrom = p.expectAcksFrom ?? [];
+    if (expectAcksFrom.length === 0) {
+      throw new Error(
+        "requires_ack messages must specify expectAcksFrom (non-empty)",
+      );
+    }
     const correlation_id = envelope.params.headers.correlation_id!;
     const rec: ReceiptRecord = {
       correlation_id,
       channel: envelope.params.routing.recipient,
       envelope,
-      expectAcksFrom: p.expectAcksFrom ?? [],
+      expectAcksFrom,
       ackedBy: new Set(),
       attempts: 0,
       state: "pending",

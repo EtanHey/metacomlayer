@@ -71,6 +71,12 @@ export class LoopbackAdapter implements VendorAdapter {
 
   /** A fake vendor pushes a reply/ack back into MCL. */
   async pushInbound(env: MclEnvelope): Promise<void> {
-    for (const h of this.inboundHandlers) await h(env);
+    const results = await Promise.allSettled(
+      this.inboundHandlers.map((h) => h(env)),
+    );
+    const failures = results.filter((r) => r.status === "rejected");
+    if (failures.length > 0) {
+      console.warn(`${failures.length} inbound handler(s) failed:`, failures);
+    }
   }
 }
