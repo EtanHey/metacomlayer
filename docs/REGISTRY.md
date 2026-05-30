@@ -45,6 +45,9 @@ The MCP server (`src/mcp/server.ts`) exposes:
 - Through the MCP server over stdio: `bun scripts/verify-mcp-server.ts` (all 7 tools; `mcl_register` → `mcl_agents` shows self in the roster).
 
 ## Notes / future
+
+- `listAgents` drains the log adaptively (resolves after a quiet gap with no new
+  events, hard-capped) so a large backlog is never silently truncated.
 - The registry log grows with every register/deregister; mcplayer WAL compaction
   bounds it. Heartbeat + `staleMs` give liveness without per-event cleanup.
 - Codex / Cursor register over the same envelope via their own MCL adapters.

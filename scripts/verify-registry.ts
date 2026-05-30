@@ -23,7 +23,7 @@ const reg = new MclRegistry(client);
 
 await reg.register({ id: A, role: "worker", capabilities: ["search", "code"] });
 await reg.register({ id: B, role: "lead" });
-const roster1 = await reg.listAgents({ windowMs: 900 });
+const roster1 = await reg.listAgents();
 const ids1 = roster1.map((a) => a.id);
 const aRec = roster1.find((a) => a.id === A);
 console.log(
@@ -31,7 +31,7 @@ console.log(
 );
 
 await reg.deregister(A);
-const roster2 = await reg.listAgents({ windowMs: 900 });
+const roster2 = await reg.listAgents();
 const ids2 = roster2.map((a) => a.id);
 console.log(
   `after deregister(A): A present=${ids2.includes(A)} B present=${ids2.includes(B)}`,

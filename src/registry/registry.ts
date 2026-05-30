@@ -66,18 +66,40 @@ export class MclRegistry {
    * last_seen is older than now-staleMs (covers a crash with no deregister).
    */
   async listAgents(
-    opts: { staleMs?: number; windowMs?: number } = {},
+    opts: { staleMs?: number; quietMs?: number; maxMs?: number } = {},
   ): Promise<AgentPresence[]> {
+    // Adaptive drain: replay from offset 0 and resolve once the backlog goes
+    // QUIET (no new event for quietMs) rather than after a fixed window — so a
+    // large log fully drains and the roster is never silently truncated. maxMs
+    // is a hard ceiling. (Unbounded log growth is bounded by mcplayer WAL
+    // compaction; a registry snapshot/compaction is a future optimization.)
+    const quietMs = opts.quietMs ?? 250;
+    const maxMs = opts.maxMs ?? 5000;
     const events: PresenceEvent[] = [];
+
+    let resolveDone!: () => void;
+    const done = new Promise<void>((r) => (resolveDone = r));
+    let quietTimer: ReturnType<typeof setTimeout> | undefined;
+    const armQuiet = () => {
+      clearTimeout(quietTimer);
+      quietTimer = setTimeout(resolveDone, quietMs);
+    };
+
     const sub = await this.client.receive(
       REGISTRY_CHANNEL,
       ({ envelope, raw }) => {
         const ev = toPresenceEvent(envelope, raw.offset);
         if (ev) events.push(ev);
+        armQuiet(); // each arrival resets the quiet timer → drain keeps going
       },
       0,
     );
-    await new Promise((r) => setTimeout(r, opts.windowMs ?? 600));
+    armQuiet(); // empty log → resolve after quietMs
+    const cap = setTimeout(resolveDone, maxMs);
+
+    await done;
+    clearTimeout(quietTimer);
+    clearTimeout(cap);
     sub.unsubscribe();
     return foldPresence(events, { staleMs: opts.staleMs, now: Date.now() });
   }
