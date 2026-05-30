@@ -11,17 +11,22 @@ import { RealMcplayer } from "../src/client/real-mcplayer";
 import { MclClient } from "../src/client/client";
 import { createMclToolset } from "../src/mcp/mcl-tools";
 
-const CH = `channel:tooltest-${process.pid}`;
+// unique ids per run → unique private ack channels, so receipts never collide
+// with a prior run's durable log (the bus persists every channel).
+const RUN = `${process.pid}-${Date.now()}`;
+const CH = `channel:tooltest-${RUN}`;
+const ID_A = `tool-test-a-${RUN}`;
+const ID_B = `tool-test-b-${RUN}`;
 
 const mpA = await RealMcplayer.open();
-const a = new MclClient(mpA, "tool-test-a");
+const a = new MclClient(mpA, ID_A);
 await a.connect();
-const toolsA = createMclToolset(a, "tool-test-a");
+const toolsA = createMclToolset(a, ID_A);
 
 const mpB = await RealMcplayer.open();
-const b = new MclClient(mpB, "tool-test-b");
+const b = new MclClient(mpB, ID_B);
 await b.connect();
-const toolsB = createMclToolset(b, "tool-test-b");
+const toolsB = createMclToolset(b, ID_B);
 
 console.log("status:", JSON.stringify(await toolsA.status()));
 
