@@ -27,7 +27,10 @@ behavior applies only to *live, acked* delivery — see `docs/PUSH-AND-INBOX.md`
 `src/registry/registry.ts` — `MclRegistry(client)`:
 - `register({ id, role?, capabilities? })` — announce live (also a **heartbeat**: re-calling refreshes `last_seen`).
 - `deregister(id)` — announce gone.
-- `listAgents({ staleMs?, windowMs? })` — current roster. `staleMs` additionally drops agents whose `last_seen` is older than `now - staleMs` (covers a crash that never sent deregister).
+- `listAgents({ staleMs?, quietMs?, maxMs? })` — **pull** the current roster. Drains the log adaptively (resolves after a quiet gap, hard-capped) so a large backlog is never truncated. `staleMs` drops agents whose `last_seen` is older than `now - staleMs`.
+- `watchAgents(onChange, { staleMs? })` — **push** the live roster: `onChange(roster)` fires on each register/deregister (and once per replayed backlog event on attach). Returns `{ stop() }`. For a TS consumer that wants a live stream instead of polling.
+
+**Language-agnostic consumers** (e.g. Swift/Python BrainBar) don't need the TS helper — subscribe `channel:registry` `from_offset:0` and apply the same fold: register adds/updates by sender id, deregister removes, last-write-wins by offset. Never ack.
 
 `src/registry/presence.ts` — the pure core: `foldPresence(events, { staleMs?, now? })` and `toPresenceEvent(envelope, offset)`. Fully unit-tested.
 
