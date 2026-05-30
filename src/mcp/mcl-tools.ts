@@ -46,7 +46,6 @@ export interface MclToolset {
   }>;
   poll(args: {
     channel: string;
-    from_offset?: number;
     wait_ms?: number;
   }): Promise<{ messages: InboxItem[] }>;
   ack(args: {
@@ -65,6 +64,10 @@ export function createMclToolset(
   const inbox = new Map<string, InboxItem[]>();
   const meta = new Map<string, InboxItem>(); // message_id -> item (for ack receipts)
   const subscribed = new Set<string>();
+  // in-flight subscribe attempts — dedupes concurrent first-polls AND lets a
+  // FAILED subscribe be retried (the channel is only marked `subscribed` after
+  // receive resolves, so a transient failure never poisons it).
+  const subscribing = new Map<string, Promise<void>>();
   // per-channel arrival waiters — resolved the INSTANT a pushed message lands,
   // so poll is an event-driven long-block (no busy-loop, no agent retry loop).
   const waiters = new Map<string, Array<() => void>>();
@@ -79,35 +82,48 @@ export function createMclToolset(
 
   async function ensureSubscribed(channel: string): Promise<void> {
     if (subscribed.has(channel)) return;
-    subscribed.add(channel);
-    await client.receive(
-      channel,
-      ({
-        envelope,
-        raw,
-      }: {
-        envelope: MclEnvelope;
-        raw: { message_id: string; offset: number };
-      }) => {
-        const item: InboxItem = {
-          from: envelope.params.routing.sender.id,
-          subject: envelope.params.payload.subject,
-          body: envelope.params.payload.body,
-          channel,
-          message_id: raw.message_id,
-          offset: raw.offset,
-          correlation_id: envelope.params.headers.correlation_id,
-          requires_ack: envelope.params.delivery_control.requires_ack,
-          thread_id: envelope.params.routing.thread_id,
-          reply_to: envelope.params.headers.reply_to,
-        };
-        const arr = inbox.get(channel) ?? [];
-        arr.push(item);
-        inbox.set(channel, arr);
-        meta.set(raw.message_id, item);
-        wake(channel); // deliver-on-arrival: unblock any waiting poll immediately
-      },
-    );
+    const existing = subscribing.get(channel);
+    if (existing) return existing;
+    const attempt = client
+      .receive(
+        channel,
+        ({
+          envelope,
+          raw,
+        }: {
+          envelope: MclEnvelope;
+          raw: { message_id: string; offset: number };
+        }) => {
+          const item: InboxItem = {
+            from: envelope.params.routing.sender.id,
+            subject: envelope.params.payload.subject,
+            body: envelope.params.payload.body,
+            channel,
+            message_id: raw.message_id,
+            offset: raw.offset,
+            correlation_id: envelope.params.headers.correlation_id,
+            requires_ack: envelope.params.delivery_control.requires_ack,
+            thread_id: envelope.params.routing.thread_id,
+            reply_to: envelope.params.headers.reply_to,
+          };
+          const arr = inbox.get(channel) ?? [];
+          arr.push(item);
+          inbox.set(channel, arr);
+          meta.set(raw.message_id, item);
+          wake(channel); // deliver-on-arrival: unblock any waiting poll immediately
+        },
+      )
+      .then(() => {
+        // mark subscribed ONLY after receive resolves — a thrown receive leaves the
+        // channel unsubscribed so the next poll retries instead of hanging forever.
+        subscribed.add(channel);
+      });
+    subscribing.set(channel, attempt);
+    try {
+      await attempt;
+    } finally {
+      subscribing.delete(channel);
+    }
   }
 
   return {
@@ -134,9 +150,11 @@ export function createMclToolset(
       };
     },
 
-    async poll({ channel, from_offset = 0, wait_ms = 30000 }) {
+    async poll({ channel, wait_ms = 30000 }) {
       await ensureSubscribed(channel);
-      void from_offset; // subscription replays from 0 once; offsets are on each item
+      // The subscription replays from offset 0 once; per-message offsets are on
+      // each returned item. (No from_offset arg: this buffered long-poll drains
+      // whatever has arrived, so a caller-supplied offset would be meaningless.)
       // Event-driven long-poll: if nothing is buffered, block on a promise that
       // the push handler resolves the instant a message arrives (or wait_ms
       // timeout). No polling interval, no CPU spin — return on arrival.
@@ -181,6 +199,7 @@ export function createMclToolset(
         await client.send(receipt);
         receipt_sent = true;
       }
+      meta.delete(message_id); // purge: bounds the map + makes a repeat ack a no-op
       return { acked: true, receipt_sent };
     },
 
