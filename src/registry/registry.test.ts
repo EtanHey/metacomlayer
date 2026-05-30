@@ -55,3 +55,42 @@ describe("MclRegistry — bus-backed presence", () => {
     expect(await reg.listAgents(fast)).toEqual([]);
   });
 });
+
+describe("MclRegistry.watchAgents — live roster push", () => {
+  const flush = () => new Promise((r) => setTimeout(r, 20));
+
+  test("emits the live roster on each register/deregister", async () => {
+    const reg = await freshRegistry();
+    const snapshots: string[][] = [];
+    const handle = await reg.watchAgents((roster) =>
+      snapshots.push(roster.map((a) => a.id)),
+    );
+
+    await reg.register({ id: "a" });
+    await reg.register({ id: "b" });
+    await reg.deregister("a");
+    await flush();
+    handle.stop();
+
+    expect(snapshots.at(-1)).toEqual(["b"]); // ends at the correct roster
+    expect(snapshots.some((s) => s.includes("a") && s.includes("b"))).toBe(
+      true,
+    ); // saw both live
+  });
+
+  test("stop() halts emissions", async () => {
+    const reg = await freshRegistry();
+    let count = 0;
+    const handle = await reg.watchAgents(() => count++);
+
+    await reg.register({ id: "a" });
+    await flush();
+    const afterFirst = count;
+    expect(afterFirst).toBeGreaterThan(0);
+
+    handle.stop();
+    await reg.register({ id: "b" });
+    await flush();
+    expect(count).toBe(afterFirst); // no emissions after stop
+  });
+});

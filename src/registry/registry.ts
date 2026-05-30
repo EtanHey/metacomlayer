@@ -103,4 +103,33 @@ export class MclRegistry {
     sub.unsubscribe();
     return foldPresence(events, { staleMs: opts.staleMs, now: Date.now() });
   }
+
+  /**
+   * Live roster push (the pull complement of listAgents — for a dashboard like
+   * BrainBar). Subscribes to the registry log, folds incrementally, and calls
+   * `onChange` with the current roster on each register/deregister (including
+   * once per replayed backlog event on attach). Returns a handle to stop().
+   * NOTE: staleMs is applied at emit time; an agent going stale with no new
+   * event won't itself trigger an emit (poll listAgents, or add a timer, for
+   * pure time-based expiry).
+   */
+  async watchAgents(
+    onChange: (roster: AgentPresence[]) => void,
+    opts: { staleMs?: number } = {},
+  ): Promise<{ stop: () => void }> {
+    const events: PresenceEvent[] = [];
+    const sub = await this.client.receive(
+      REGISTRY_CHANNEL,
+      ({ envelope, raw }) => {
+        const ev = toPresenceEvent(envelope, raw.offset);
+        if (!ev) return;
+        events.push(ev);
+        onChange(
+          foldPresence(events, { staleMs: opts.staleMs, now: Date.now() }),
+        );
+      },
+      0,
+    );
+    return { stop: () => sub.unsubscribe() };
+  }
 }
