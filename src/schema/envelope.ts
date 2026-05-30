@@ -20,6 +20,8 @@ export const MclMethod = z.enum([
   "mcl.headsup",
   "mcl.ack",
   "mcl.broadcast",
+  "mcl.register",
+  "mcl.deregister",
 ]);
 export type MclMethod = z.infer<typeof MclMethod>;
 
@@ -87,6 +89,8 @@ const METHOD_TO_A2A: Record<MclMethod, string> = {
   "mcl.headsup": "task.headsup",
   "mcl.ack": "task.ack",
   "mcl.broadcast": "task.broadcast",
+  "mcl.register": "presence.register",
+  "mcl.deregister": "presence.deregister",
 };
 
 export interface BuildInput {
