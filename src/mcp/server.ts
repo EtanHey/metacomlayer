@@ -18,6 +18,7 @@ import { z } from "zod";
 import { RealMcplayer } from "../client/real-mcplayer";
 import { MclClient } from "../client/client";
 import { createMclToolset } from "./mcl-tools";
+import { MclRegistry } from "../registry/registry";
 
 const AGENT_ID = process.env.MCL_AGENT_ID ?? "mcl-agent";
 
@@ -25,6 +26,7 @@ const mp = await RealMcplayer.open(); // MCPLAYER_SOCKET
 const client = new MclClient(mp, AGENT_ID);
 await client.connect();
 const tools = createMclToolset(client, AGENT_ID);
+const registry = new MclRegistry(client);
 
 const server = new McpServer({ name: "metacomlayer", version: "0.1.0" });
 
@@ -86,6 +88,62 @@ server.tool(
   async () => {
     const r = await tools.status();
     return { content: [{ type: "text", text: JSON.stringify(r) }] };
+  },
+);
+
+server.tool(
+  "mcl_register",
+  "Announce yourself as a LIVE agent in the MCL presence registry (so others can discover you via mcl_agents). Call once on startup; call again any time to refresh your presence (heartbeat). Uses your MCL_AGENT_ID as the agent id.",
+  {
+    role: z
+      .string()
+      .optional()
+      .describe('Your role, e.g. "lead", "worker" (default "agent")'),
+    capabilities: z
+      .array(z.string())
+      .optional()
+      .describe('What you can do, e.g. ["search","code"]'),
+  },
+  async (args) => {
+    await registry.register({
+      id: AGENT_ID,
+      role: args.role,
+      capabilities: args.capabilities,
+    });
+    return {
+      content: [
+        { type: "text", text: JSON.stringify({ registered: AGENT_ID }) },
+      ],
+    };
+  },
+);
+
+server.tool(
+  "mcl_deregister",
+  "Announce that you are LEAVING — removes you from the live roster. Call on graceful shutdown. Uses your MCL_AGENT_ID.",
+  {},
+  async () => {
+    await registry.deregister(AGENT_ID);
+    return {
+      content: [
+        { type: "text", text: JSON.stringify({ deregistered: AGENT_ID }) },
+      ],
+    };
+  },
+);
+
+server.tool(
+  "mcl_agents",
+  "List the currently LIVE agents (the MCL roster): id, role, capabilities, last_seen. Use this to discover who is online before messaging them. Pass stale_ms to also drop agents that haven't refreshed within that window (covers crashes with no deregister).",
+  {
+    stale_ms: z
+      .number()
+      .optional()
+      .describe("Drop agents whose last_seen is older than this many ms"),
+  },
+  async (args) => {
+    const agents = await registry.listAgents({ staleMs: args.stale_ms });
+    return { content: [{ type: "text", text: JSON.stringify({ agents }) }] };
   },
 );
 
