@@ -200,6 +200,36 @@ describe("clx journal-core CLI", () => {
     expect(result.stderr).toContain("SQLITE_PATH_CONTAINMENT");
   });
 
+  test("rejects oversized JSON payloads before writing an event", async () => {
+    const home = await tempHome();
+    const result = await runClx(
+      ["append", "x", "note", JSON.stringify({ body: "x".repeat(70 * 1024) })],
+      { home },
+    );
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("CLX_PAYLOAD_TOO_LARGE");
+    expect(readEvents(dbPath(home))).toHaveLength(1);
+  });
+
+  test("resume on a missing seat returns a named not-found error", async () => {
+    const home = await tempHome();
+    const result = await runClx(["resume", "missing"], { home });
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("CLX_NOT_FOUND");
+    expect(result.stderr).toContain("missing");
+  });
+
+  test("resume uses the latest park event for a seat", async () => {
+    const home = await tempHome();
+    await runClx(["park", "demo", "--brief", "first park"], { home });
+    await runClx(["park", "demo", "--brief", "second park"], { home });
+
+    const resume = await runClx(["resume", "demo"], { home });
+    expect(resume.exitCode).toBe(0);
+    expect(resume.stdout).toContain("second park");
+    expect(resume.stdout).not.toContain("first park");
+  });
+
   test("source keeps events append-only by exposing no UPDATE or DELETE event-row path", async () => {
     const source = await readFile(join(import.meta.dir, "cli.ts"), "utf8");
     expect(source).not.toMatch(/\bUPDATE\s+events\b/i);

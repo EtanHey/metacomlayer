@@ -1,7 +1,9 @@
 import { Database } from "bun:sqlite";
 import { mkdir, writeFile } from "node:fs/promises";
-import { dirname, resolve, sep } from "node:path";
+import { realpathSync, statSync } from "node:fs";
+import { basename, dirname, resolve, sep } from "node:path";
 
+const MAX_PAYLOAD_BYTES = 64 * 1024;
 const SPINE_RULING =
   "ONE journal. clx journal-core (append / marker fan-out / tail) + the `clx` CLI = controllayer-mcl deliverable. orc PR-J1 = the consumer layer (board/at-risk/deliverables/rehydrate/verify + G-board seed) + ledger POLICY + P4 gh-verify. DB = ~/.local/share/orc/fleet-journal.db, standalone WAL. Push primitive = write-side marker files + native CC Monitor (NOT brain_subscribe — those are notImplemented stubs). No journal PR before controllayer's in-channel ack (posted 2026-06-10 19:48 IDT).";
 
@@ -30,7 +32,26 @@ function homeDir() {
   if (!home) {
     throw new CliError("SQLITE_PATH_CONTAINMENT", "HOME is required");
   }
-  return home;
+  try {
+    const resolved = realpathSync(home);
+    const stats = statSync(resolved);
+    if (!stats.isDirectory()) {
+      throw new CliError("SQLITE_PATH_CONTAINMENT", "HOME must be a directory");
+    }
+    if (process.platform !== "win32" && (stats.mode & 0o002) !== 0) {
+      throw new CliError(
+        "SQLITE_PATH_CONTAINMENT",
+        "HOME must not be world-writable",
+      );
+    }
+    return resolved;
+  } catch (error) {
+    if (error instanceof CliError) throw error;
+    throw new CliError(
+      "SQLITE_PATH_CONTAINMENT",
+      error instanceof Error ? `invalid HOME: ${error.message}` : "invalid HOME",
+    );
+  }
 }
 
 function orcBase() {
@@ -39,7 +60,7 @@ function orcBase() {
 
 function assertContained(path: string, label: string) {
   const base = orcBase();
-  const resolved = resolve(path);
+  const resolved = canonicalPath(path);
   if (resolved !== base && !resolved.startsWith(`${base}${sep}`)) {
     throw new CliError(
       "SQLITE_PATH_CONTAINMENT",
@@ -47,6 +68,14 @@ function assertContained(path: string, label: string) {
     );
   }
   return resolved;
+}
+
+function canonicalPath(path: string) {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(realpathSync(dirname(path)), basename(path));
+  }
 }
 
 function parseGlobalArgs(argv: string[]) {
@@ -80,14 +109,16 @@ function isBusy(error: unknown) {
 }
 
 async function withBusyRetry<T>(operation: () => T | Promise<T>): Promise<T> {
+  const maxAttempts = 5;
+  const baseDelayMs = 50;
   let last: unknown;
-  for (let attempt = 0; attempt < 6; attempt++) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
       return await operation();
     } catch (error) {
-      if (!isBusy(error) || attempt === 5) throw error;
+      if (!isBusy(error) || attempt === maxAttempts - 1) throw error;
       last = error;
-      await Bun.sleep(15 * (attempt + 1));
+      await Bun.sleep(baseDelayMs * 2 ** attempt);
     }
   }
   throw last;
@@ -128,6 +159,12 @@ function seedSpineRuling(db: Database) {
 }
 
 function parseJson(input: string) {
+  if (Buffer.byteLength(input, "utf8") > MAX_PAYLOAD_BYTES) {
+    throw new CliError(
+      "CLX_PAYLOAD_TOO_LARGE",
+      `JSON payload exceeds ${MAX_PAYLOAD_BYTES} bytes`,
+    );
+  }
   try {
     return JSON.parse(input) as unknown;
   } catch (error) {
@@ -189,6 +226,8 @@ async function appendPark(
       const next = db
         .query("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events")
         .get() as { seq: number };
+      // The park event is the snapshot boundary. Resume reads events after this
+      // seq so the park row itself is not duplicated under late arrivals.
       const parkPayload = {
         brief,
         snapshot_manifest: {
@@ -364,7 +403,15 @@ async function run(argv: string[]) {
 
     throw new CliError("CLX_USAGE", `unknown verb: ${verb}`);
   } finally {
-    db.close();
+    try {
+      db.close();
+    } catch (error) {
+      console.error(
+        `CLX_DB_CLOSE: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
   }
 }
 
