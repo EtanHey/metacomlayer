@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Database } from "bun:sqlite";
 
-const CLI = ["src/clx/cli.ts"];
+const CLI = [join(process.cwd(), "src/clx/cli.ts")];
 
 type RunOptions = {
   home: string;
