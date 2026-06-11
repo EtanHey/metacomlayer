@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, copyFile, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, copyFile, readFile, writeFile } from "node:fs/promises";
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -69,6 +69,74 @@ beforeAll(() => {
 });
 
 describe("clx journal-core CLI", () => {
+  test("boot registers a seat through the clx entrypoint", async () => {
+    const home = await tempHome();
+    const seatFile = join(home, "seat.json");
+    await writeFile(
+      seatFile,
+      JSON.stringify({
+        seat: "clxBootFold",
+        role: "worker",
+        channel: "gen-16",
+        pinned_model: "claude-opus-4-8[1m]",
+        monitor_task_id: "monitor-123",
+        require_mcp: ["cmux", "brainlayer"],
+      }),
+    );
+
+    const result = await runClx(
+      [
+        "boot",
+        seatFile,
+        "--list-cmd",
+        "printf 'cmux: bun - ✔ Connected\\nbrainlayer: bun - ✔ Connected\\n'",
+        "--observed-model",
+        "claude-opus-4-8[1m]",
+      ],
+      { home },
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("clx boot ✓ clxBootFold");
+    const event = readEvents(dbPath(home)).at(-1)!;
+    expect(event.type).toBe("seat.register");
+    expect(event.seat).toBe("clxBootFold");
+    expect(JSON.parse(event.payload_json).monitor_task_id).toBe("monitor-123");
+  });
+
+  test("roster lists seats through the clx entrypoint", async () => {
+    const home = await tempHome();
+    const seatFile = join(home, "seat.json");
+    await writeFile(
+      seatFile,
+      JSON.stringify({
+        seat: "clxRosterFold",
+        role: "worker",
+        channel: "gen-16",
+        pinned_model: "claude-opus-4-8[1m]",
+        monitor_task_id: "monitor-456",
+        require_mcp: ["cmux", "brainlayer"],
+      }),
+    );
+    await runClx(
+      [
+        "boot",
+        seatFile,
+        "--list-cmd",
+        "printf 'cmux: bun - ✔ Connected\\nbrainlayer: bun - ✔ Connected\\n'",
+        "--observed-model",
+        "claude-opus-4-8[1m]",
+      ],
+      { home },
+    );
+
+    const result = await runClx(["roster"], { home });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("clxRosterFold");
+    expect(result.stdout).toContain("monitor-456");
+  });
+
   test("seeds the spine ruling, parks, emits, and resumes late arrivals from a copied DB in a fresh cwd", async () => {
     const home = await tempHome();
     const park = await runClx(
