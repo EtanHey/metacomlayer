@@ -28,6 +28,24 @@ bun scripts/verify-mcp-server.ts   # all 7 MCP tools over stdio
 
 Delivery is real, not "bytes queued": SHIP-3 reaches **VERIFIED** only after the recipient ACKs to the sender's private `channel:ack:<id>`. Push (`docs/PUSH-AND-INBOX.md`) and presence (`docs/REGISTRY.md`) ride the same envelope — no new transport.
 
+## Pass-3 local runner
+
+`scripts/pass3-runner.sh` runs the gated Pass-3 graphify job in checkpointed Ollama batches. Each batch is wrapped by `bun run stamp-perf run`, so the journal receives one `local.perf` row with the actual model, duration, memory pressure, swap, and resident model process snapshot.
+
+```sh
+# Acceptance proof: exactly one real tiny Ollama batch, then stop.
+bash scripts/pass3-runner.sh --dry-run
+
+# Resume proof: the same dry-run skips the checkpointed cmuxlayer:1 batch.
+bash scripts/pass3-runner.sh --dry-run
+
+# Abort-path proof: journals pass3.aborted and exits non-zero before inference.
+PASS3_MEMORY_THRESHOLD=100 bash scripts/pass3-runner.sh --dry-run
+echo $? # 75
+```
+
+Defaults target `cmuxlayer` first, followed by the local ecosystem repo list under `$HOME/Gits`; set `PASS3_REPO_ROOT` or pass `--repo/--repos` for another checkout root. `PASS3_MEMORY_THRESHOLD` is a minimum free-memory percentage: if `memory_pressure` reports free memory below the threshold, the runner writes a `perf/pass3.aborted` journal row and exits 75 before inference. Full runs are intentionally only fired by omitting `--dry-run`; the script keeps `OLLAMA_KEEP_ALIVE=0` for wrapped calls and writes checkpoints to `~/.local/share/orc/pass3-checkpoint.json` unless `--checkpoint` or `PASS3_CHECKPOINT` is set.
+
 ## The MCL↔mcplayer seam (LOCKED, co-signed by the mcplayer track)
 `mcplayer` exposes a UDS / NDJSON / JSON-RPC 2.0 endpoint; MCL consumes exactly 5 methods — `connect`, `publish`, `subscribe`, `ack`, `status`. `mcplayer` owns the durable queue (WAL + at-least-once + per-channel ordering). MCL builds against `MockMcplayer`; swapping to the real `mcplayer` is a **zero-MCL-change** drop-in (same 5 methods). Amendments locked: two-plane stability (connect/status independent of the queue), bounded-WAL BUSY-nack (`-32004`, never a silent drop), monotonic offsets resumable across an `mcplayer` restart.
 
