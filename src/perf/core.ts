@@ -34,6 +34,18 @@ export function parseResidentModels(
   return [...seen];
 }
 
+/** `osascript` visible-process list → app names, or [] when output is empty/error-shaped. */
+export function parseOpenApps(osascriptOutput: string): string[] {
+  const out = osascriptOutput.trim();
+  if (out.length === 0) return [];
+  if (/error|execution error|not authorized|not allowed/i.test(out)) return [];
+  if (!out.includes(",")) return [];
+  return out
+    .split(",")
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0);
+}
+
 /** tokens/sec, only when both are present and duration > 0 (else null — no divide-by-zero, no fabrication). */
 export function computeTokensPerS(
   tokens: number | null,
@@ -74,5 +86,52 @@ export function buildPerfPayload(input: {
     memory_pressure: input.freePct,
     swap_used_mb: input.swapUsedMb,
     resident_models: input.residentModels,
+  };
+}
+
+export type CliRunOutcome = "ok" | "fail" | "killed";
+
+export interface CliRunPayload {
+  agent: string;
+  repo: string;
+  duration_s: number;
+  outcome: CliRunOutcome;
+  pr?: number;
+}
+
+export function buildCliRunPayload(input: {
+  agent: string;
+  repo: string;
+  durationS: number;
+  outcome: CliRunOutcome;
+  pr?: number;
+}): CliRunPayload {
+  return {
+    agent: input.agent,
+    repo: input.repo,
+    duration_s: input.durationS,
+    outcome: input.outcome,
+    ...(input.pr === undefined ? {} : { pr: input.pr }),
+  };
+}
+
+export interface SysSnapshotPayload {
+  memory_pressure: number | null;
+  swap_used_mb: number | null;
+  resident_models: string[];
+  open_apps: string[];
+}
+
+export function buildSysSnapshotPayload(input: {
+  freePct: number | null;
+  swapUsedMb: number | null;
+  residentModels: string[];
+  openApps: string[];
+}): SysSnapshotPayload {
+  return {
+    memory_pressure: input.freePct,
+    swap_used_mb: input.swapUsedMb,
+    resident_models: input.residentModels,
+    open_apps: input.openApps,
   };
 }
