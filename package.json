@@ -8,6 +8,7 @@
     "clx": "bun src/clx/cli.ts",
     "clx-boot": "bun src/boot/cli.ts",
     "mcp-preflight": "bun src/preflight/cli.ts",
+    "stamp-perf": "bun src/perf/cli.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit --skipLibCheck"
   },
