@@ -11,8 +11,9 @@
  * Exit 0 = all gates pass; 1 = a BLOCKER (named, never silently degraded); 2 = usage.
  */
 import { Database } from "bun:sqlite";
-import { resolve, isAbsolute, relative } from "node:path";
+import { dirname, resolve, isAbsolute, relative } from "node:path";
 import { homedir } from "node:os";
+import { realpathSync } from "node:fs";
 import { readFile, readdir, stat, mkdir } from "node:fs/promises";
 import {
   parseSeatFile,
@@ -24,7 +25,7 @@ import {
 } from "./core";
 
 function orcBase() {
-  return resolve(homedir(), ".local/share/orc");
+  return resolve(realpathSync(homedir()), ".local/share/orc");
 }
 // SQLITE_PATH_CONTAINMENT (same guard class as the spine): DB must live under ~/.local/share/orc.
 function assertContained(path: string): string {
@@ -51,15 +52,16 @@ class CliError extends Error {
   }
 }
 
-function dbPath(): string {
+function dbPath(override?: string): string {
   return assertContained(
-    process.env.JOURNAL_DB ?? resolve(orcBase(), "fleet-journal.db"),
+    override ?? process.env.JOURNAL_DB ?? resolve(orcBase(), "fleet-journal.db"),
   );
 }
 
-async function openDb(): Promise<Database> {
-  await mkdir(orcBase(), { recursive: true });
-  const db = new Database(dbPath());
+async function openDb(pathOverride?: string): Promise<Database> {
+  const path = dbPath(pathOverride);
+  await mkdir(dirname(path), { recursive: true });
+  const db = new Database(path);
   db.exec("PRAGMA busy_timeout=5000;");
   db.exec("PRAGMA journal_mode=WAL;");
   db.exec(
@@ -136,7 +138,10 @@ async function getMcpListing(args: string[]): Promise<string> {
   return new TextDecoder().decode(proc.stdout);
 }
 
-async function cmdBoot(args: string[]): Promise<number> {
+export async function cmdBoot(
+  args: string[],
+  dbPathOverride?: string,
+): Promise<number> {
   const seatPath = args.find((a) => !a.startsWith("--") && a !== "boot");
   if (!seatPath)
     throw new CliError("CLX_BOOT_USAGE", "boot requires <seat-file.json>", 2);
@@ -148,7 +153,7 @@ async function cmdBoot(args: string[]): Promise<number> {
   });
   const verdict = bootVerdict({ seat, mcpListing, observed });
 
-  const db = await openDb();
+  const db = await openDb(dbPathOverride);
   if (verdict.ok) {
     appendEvent(db, "seat", seat.seat, "seat.register", {
       role: seat.role,
@@ -184,8 +189,11 @@ async function cmdBoot(args: string[]): Promise<number> {
   return verdict.ok ? 0 : 1;
 }
 
-async function cmdRoster(args: string[]): Promise<number> {
-  const db = await openDb();
+export async function cmdRoster(
+  args: string[],
+  dbPathOverride?: string,
+): Promise<number> {
+  const db = await openDb(dbPathOverride);
   const rows = db
     .query(
       "SELECT seat, payload_json, ts FROM events WHERE type='seat.register' ORDER BY seq",
@@ -218,7 +226,7 @@ async function cmdRoster(args: string[]): Promise<number> {
   return 0;
 }
 
-async function main(): Promise<number> {
+export async function main(): Promise<number> {
   const argv = process.argv.slice(2);
   const verb = argv[0];
   try {
@@ -238,4 +246,6 @@ async function main(): Promise<number> {
   }
 }
 
-main().then((code) => process.exit(code));
+if (import.meta.main) {
+  main().then((code) => process.exit(code));
+}

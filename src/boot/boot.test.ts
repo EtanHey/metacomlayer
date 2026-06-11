@@ -142,6 +142,52 @@ describe("clx boot — verdict (gates 1+2 composed)", () => {
 });
 
 describe("clx boot — roster (gate 3 read path)", () => {
+  test("clx-boot roster remains available through the package script", async () => {
+    const home = await tempHome();
+    const db = new Database(join(home, ".local/share/orc/fleet-journal.db"));
+    db.exec(
+      `CREATE TABLE events (
+         seq INTEGER PRIMARY KEY AUTOINCREMENT,
+         ts TEXT NOT NULL, topic TEXT NOT NULL, seat TEXT,
+         type TEXT NOT NULL, payload_json TEXT NOT NULL,
+         ack_state TEXT NOT NULL DEFAULT 'none'
+       );`,
+    );
+    db.query(
+      "INSERT INTO events (ts, topic, seat, type, payload_json) VALUES (?,?,?,?,?)",
+    ).run(
+      "2026-06-11T00:00:00Z",
+      "seat",
+      "legacyBoot",
+      "seat.register",
+      JSON.stringify({
+        role: "worker",
+        channel: "gen-16",
+        monitor_task_id: "legacy-monitor",
+        pinned_model: "claude-opus-4-8[1m]",
+      }),
+    );
+    db.close();
+
+    const proc = Bun.spawn({
+      cmd: ["bun", "run", "clx-boot", "roster"],
+      cwd: process.cwd(),
+      env: { PATH: process.env.PATH ?? "", HOME: home },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+
+    expect(exitCode).toBe(0);
+    expect(stderr).toContain("bun src/boot/cli.ts roster");
+    expect(stdout).toContain("legacyBoot");
+    expect(stdout).toContain("legacy-monitor");
+  });
+
   test("formats latest-per-seat from seat.register rows", () => {
     const rows = [
       {

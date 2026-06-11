@@ -71,6 +71,7 @@ beforeAll(() => {
 describe("clx journal-core CLI", () => {
   test("boot registers a seat through the clx entrypoint", async () => {
     const home = await tempHome();
+    const customDb = join(home, ".local/share/orc/clx-boot-fold.db");
     const seatFile = join(home, "seat.json");
     await writeFile(
       seatFile,
@@ -88,6 +89,8 @@ describe("clx journal-core CLI", () => {
       [
         "boot",
         seatFile,
+        "--db",
+        customDb,
         "--list-cmd",
         "printf 'cmux: bun - ✔ Connected\\nbrainlayer: bun - ✔ Connected\\n'",
         "--observed-model",
@@ -98,7 +101,9 @@ describe("clx journal-core CLI", () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("clx boot ✓ clxBootFold");
-    const event = readEvents(dbPath(home)).at(-1)!;
+    const events = readEvents(customDb);
+    expect(events.length).toBeGreaterThan(0);
+    const event = events.at(-1)!;
     expect(event.type).toBe("seat.register");
     expect(event.seat).toBe("clxBootFold");
     expect(JSON.parse(event.payload_json).monitor_task_id).toBe("monitor-123");
@@ -106,6 +111,7 @@ describe("clx journal-core CLI", () => {
 
   test("roster lists seats through the clx entrypoint", async () => {
     const home = await tempHome();
+    const customDb = join(home, ".local/share/orc/clx-roster-fold.db");
     const seatFile = join(home, "seat.json");
     await writeFile(
       seatFile,
@@ -118,10 +124,12 @@ describe("clx journal-core CLI", () => {
         require_mcp: ["cmux", "brainlayer"],
       }),
     );
-    await runClx(
+    const bootResult = await runClx(
       [
         "boot",
         seatFile,
+        "--db",
+        customDb,
         "--list-cmd",
         "printf 'cmux: bun - ✔ Connected\\nbrainlayer: bun - ✔ Connected\\n'",
         "--observed-model",
@@ -129,8 +137,9 @@ describe("clx journal-core CLI", () => {
       ],
       { home },
     );
+    expect(bootResult.exitCode).toBe(0);
 
-    const result = await runClx(["roster"], { home });
+    const result = await runClx(["roster", "--db", customDb], { home });
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("clxRosterFold");

@@ -330,6 +330,18 @@ async function run(argv: string[]) {
   const { args, dbPath } = parseGlobalArgs(argv);
   const verb = args[0];
   if (!verb) throw new CliError("CLX_USAGE", "missing verb");
+  if (verb === "boot") {
+    const { cmdBoot } = await import("../boot/cli");
+    const code = await cmdBoot(args.slice(1), dbPath);
+    process.exitCode = code;
+    return;
+  }
+  if (verb === "roster") {
+    const { cmdRoster } = await import("../boot/cli");
+    const code = await cmdRoster(args.slice(1), dbPath);
+    process.exitCode = code;
+    return;
+  }
   const { markersDir } = await preparePaths(dbPath);
   const db = await openDb(dbPath);
   try {
@@ -401,7 +413,10 @@ async function run(argv: string[]) {
       return;
     }
 
-    throw new CliError("CLX_USAGE", `unknown verb: ${verb}`);
+    throw new CliError(
+      "CLX_USAGE",
+      `unknown verb: ${verb}; expected append | emit | tail | park | resume | boot | roster`,
+    );
   } finally {
     try {
       db.close();
