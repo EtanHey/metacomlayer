@@ -1,4 +1,6 @@
-import { test, expect, beforeAll } from "bun:test";
+import { test as bunTest, expect, beforeAll } from "bun:test";
+// macOS-only: these shell out to memory_pressure/vm_stat/sysctl/date -j. Skip on Linux CI.
+const test = process.platform === "darwin" ? bunTest : bunTest.skip;
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   mkdtempSync,
@@ -270,4 +272,19 @@ test("the seat-held embedder is NOT reclaimed even if idle", () => {
     RAM_SEAT_HOLD: seat,
   });
   expect(killed).toBe(""); // the legit queued job is protected
+});
+
+test("a bge-large DAEMON is protected (NOT reclaimed) even when idle — C2 fix", () => {
+  // bge-large is a day-to-day daemon (protected list), NOT in the backfill reclaim pattern
+  const ps = psFixture([
+    `8104 ${KB(4)} /opt/homebrew/bin/bge-large-embedder --serve`,
+  ]);
+  const psCpu = psCpuFixture([
+    `8104 0.0 ${KB(4)} /opt/homebrew/bin/bge-large-embedder --serve`,
+  ]);
+  const { killed } = runGuardian(ps, SAFE(), {
+    HEAVY_ML_MEMPRESSURE_FIXTURE: mem(4), // danger
+    HEAVY_ML_PS_CPU_FIXTURE: psCpu,
+  });
+  expect(killed).toBe(""); // daemon stays booted; only transient backfill jobs are reclaimable
 });

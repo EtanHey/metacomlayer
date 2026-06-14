@@ -26,6 +26,10 @@
     <string>clx-guard</string>
     <key>HEAVY_ML_GUARD_ENABLE_KILL</key>
     <string>1</string>
+    <!-- Pin the seat path explicitly (absolute, not TMPDIR) so the guardian and ram-seat.sh
+         always resolve the SAME seat — never kill the seated legit job. -->
+    <key>RAM_SEAT_HOLD</key>
+    <string>/Users/etanheyman/.local/state/clx-guard/ram-seat/holder</string>
   </dict>
 
   <key>RunAtLoad</key>

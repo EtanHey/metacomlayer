@@ -1,4 +1,6 @@
-import { test, expect, beforeAll } from "bun:test";
+import { test as bunTest, expect, beforeAll } from "bun:test";
+// macOS-only: these shell out to memory_pressure/vm_stat/sysctl/date -j. Skip on Linux CI.
+const test = process.platform === "darwin" ? bunTest : bunTest.skip;
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";

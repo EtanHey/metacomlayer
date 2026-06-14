@@ -40,8 +40,10 @@ Runs every 60 s (launchd). Trips on:
   (default 900 s) — the Jun-11 silent-death case.
 
 On a trip: JSON status to stdout (always), Telegram notify, and a `clx emit local.ram.guard` event
-(the clx-03 control-layer through-line). **Guarded kill is opt-in** (`HEAVY_ML_GUARD_ENABLE_KILL=1`,
-off by default — alert-first per clx-03; TERMs all-but-the-largest on a mutex breach).
+(the clx-03 control-layer through-line). **Guarded autokill is ON by default**
+(`HEAVY_ML_GUARD_ENABLE_KILL=1`, Etan ruling 2026-06-14) but reaps **TRUE RUNAWAYS ONLY** — see
+the "Update 2026-06-14" section below for the exact (and only) conditions under which it kills.
+Set it to `0` for alert-only.
 
 A "heavy-ML proc" = command matches `llama-server|ollama|whisper-server|mlx|python` **and** RSS ≥
 `HEAVY_ML_MIN_GB` (default 3 GB). cmux / claude / codex / cursor never match.
@@ -79,7 +81,10 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.golems.heavy-ml-guar
 | `HEAVY_ML_AGG_DANGER_GB` | 24 | aggregate ML footprint danger |
 | `HEAVY_ML_COMPRESSOR_DANGER_GB` | 12 | compressor danger |
 | `HEAVY_ML_SAMPLER_STALE_SECONDS` | 900 | sampler freshness window |
-| `HEAVY_ML_GUARD_ENABLE_KILL` | 0 | 1 = guarded kill all-but-largest on mutex breach |
+| `HEAVY_ML_GUARD_ENABLE_KILL` | **1** | autokill true runaways under danger; `0` = alert-only |
+| `HEAVY_ML_RUNAWAY_GB` | 12 | a non-protected, non-seat proc ≥ this under danger = runaway |
+| `HEAVY_ML_FREE_RAM_DANGER_PCT` | 8 | free system memory % below this = danger |
+| `HEAVY_ML_SWAP_DANGER_PCT` | 80 | swap used % above this = danger |
 | `HEAVY_ML_CLX_CLI` | (unset) | e.g. `bun .../src/clx/cli.ts` to emit `local.ram.guard` events |
 
 ---

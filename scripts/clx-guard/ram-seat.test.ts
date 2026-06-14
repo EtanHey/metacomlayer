@@ -1,4 +1,6 @@
-import { test, expect, beforeAll } from "bun:test";
+import { test as bunTest, expect, beforeAll } from "bun:test";
+// macOS-targeted seat/queue scripts; skip on Linux CI (kept green) — verified on macOS.
+const test = process.platform === "darwin" ? bunTest : bunTest.skip;
 import { execFileSync } from "node:child_process";
 import {
   mkdtempSync,

@@ -19,7 +19,10 @@
 # never autokills it; anything heavy that skips the seat is a runaway candidate.
 set -euo pipefail
 
-RAM_SEAT_DIR="${RAM_SEAT_DIR:-${TMPDIR:-/tmp}/ram-seat}"
+# FIXED absolute path (NOT TMPDIR) so the launchd guardian and an interactive shell ALWAYS
+# resolve the same seat — a TMPDIR mismatch would make the guardian blind to the seat and risk
+# killing the seated legit job. Keep this in sync with heavy-ml-guardian.sh's RAM_SEAT_HOLD.
+RAM_SEAT_DIR="${RAM_SEAT_DIR:-$HOME/.local/state/clx-guard/ram-seat}"
 RAM_SEAT_HOLD="$RAM_SEAT_DIR/holder"          # mkdir lock == the one seat
 RAM_SEAT_QUEUE="$RAM_SEAT_DIR/queue"          # ticket files, lexically ordered = FIFO
 RAM_SEAT_SEQLOCK="$RAM_SEAT_DIR/seq.lock"     # brief lock to allocate a ticket number
@@ -35,10 +38,12 @@ log() { printf '[ram-seat] %s\n' "$*" >&2; }
 _ensure() { mkdir -p "$RAM_SEAT_QUEUE"; [[ -f "$RAM_SEAT_SEQ" ]] || echo 0 >"$RAM_SEAT_SEQ"; }
 
 _alloc_ticket() {
-  local n waited=0
+  local n waited=0 reclaimed=0
   while ! mkdir "$RAM_SEAT_SEQLOCK" 2>/dev/null; do
     sleep 0.1; waited=$((waited + 1))
-    (( waited > 100 )) && rm -rf "$RAM_SEAT_SEQLOCK"   # reclaim a wedged seq lock
+    # Reclaim a wedged seq lock ONCE (not every iteration — repeatedly rm'ing could delete a
+    # fresh holder's lock mid-allocation and hand two allocators the same ticket number).
+    if (( waited > 100 && reclaimed == 0 )); then rm -rf "$RAM_SEAT_SEQLOCK"; reclaimed=1; fi
   done
   n="$(cat "$RAM_SEAT_SEQ" 2>/dev/null || echo 0)"; n=$((n + 1)); echo "$n" >"$RAM_SEAT_SEQ"
   rmdir "$RAM_SEAT_SEQLOCK" 2>/dev/null || true

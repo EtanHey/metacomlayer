@@ -36,7 +36,7 @@ HEAVY_ML_NOTIFY_PRIORITY="${HEAVY_ML_NOTIFY_PRIORITY:-high}"
 HEAVY_ML_CLX_CLI="${HEAVY_ML_CLX_CLI:-}"                      # e.g. "bun /path/src/clx/cli.ts" — emit local.ram.guard events
 HEAVY_ML_GUARD_ENABLE_KILL="${HEAVY_ML_GUARD_ENABLE_KILL:-1}" # 1 = autokill TRUE runaways only (Etan ruling 2026-06-14). 0 = alert-only.
 HEAVY_ML_RUNAWAY_GB="${HEAVY_ML_RUNAWAY_GB:-12}"             # a non-seat, non-protected proc at/above this RSS, under danger, is a runaway
-HEAVY_ML_KILL_BIN="${HEAVY_ML_KILL_BIN:-kill}"
+HEAVY_ML_KILL_BIN="${HEAVY_ML_KILL_BIN:-/bin/kill}"   # pinned for the minimal launchd PATH
 HEAVY_ML_TERM_GRACE_SECONDS="${HEAVY_ML_TERM_GRACE_SECONDS:-8}"
 
 # Free-RAM / swap danger (the gen-16 RAM-alert profile: free RAM cratered + swap climbed while
@@ -45,21 +45,27 @@ HEAVY_ML_TERM_GRACE_SECONDS="${HEAVY_ML_TERM_GRACE_SECONDS:-8}"
 HEAVY_ML_FREE_RAM_DANGER_PCT="${HEAVY_ML_FREE_RAM_DANGER_PCT:-8}"
 HEAVY_ML_SWAP_DANGER_PCT="${HEAVY_ML_SWAP_DANGER_PCT:-80}"
 
-# Stale-embedder reclaim: a BACKFILL/embedder job (NOT the voice daemons) that is IDLE
-# (double-sampled CPU) and holding RAM under danger is a stale orphan — safe to reclaim
-# (Etan/weaver 2026-06-14: "if a stale/idle embedder is holding RAM, reclaim it; else throttle").
-HEAVY_ML_EMBEDDER_PATTERN="${HEAVY_ML_EMBEDDER_PATTERN:-bge-large|reembed|embed_backfill|embed-backfill|embed_pending|embed_backlog}"
+# Stale-embedder reclaim: a transient BACKFILL JOB (NOT a daemon, NOT the voice stack) that is
+# IDLE (double-sampled CPU) and holding RAM under danger is a stale orphan — safe to reclaim
+# (Etan/weaver 2026-06-14: "if a stale/idle embedder backfill is holding RAM, reclaim it; else
+# throttle"). NOTE: job-only names — `bge-large` is intentionally NOT here (a bge-large *daemon*
+# stays booted via the protected list; only the backfill *job* is reclaimable).
+HEAVY_ML_EMBEDDER_PATTERN="${HEAVY_ML_EMBEDDER_PATTERN:-reembed|embed_backfill|embed-backfill|embed_pending|embed_backlog}"
 HEAVY_ML_EMBEDDER_RECLAIM_GB="${HEAVY_ML_EMBEDDER_RECLAIM_GB:-2}"
 HEAVY_ML_IDLE_CPU_PCT="${HEAVY_ML_IDLE_CPU_PCT:-5}"            # <= this %CPU on BOTH samples = idle
 HEAVY_ML_IDLE_SAMPLE_SLEEP="${HEAVY_ML_IDLE_SAMPLE_SLEEP:-2}" # gap between the two CPU samples
 
-# NEVER autokill these — day-to-day holders that must "stay booted" (Etan: nothing quits
-# unexpectedly). Wispr STT, the voice LLM (mlx_lm.server), ollama, and an actively-working
-# embedder (bge/embed) are protected from the blunt runaway-kill. An IDLE/stale embedder is
-# reclaimed only via the careful double-sampled stale_embedder_reclaim path below.
-HEAVY_ML_PROTECTED_PATTERN="${HEAVY_ML_PROTECTED_PATTERN:-whisper-server|mlx_lm\.server|ollama|bge-large|embed}"
-# The RAM-seat holder is the ONE legit heavy job and is never killed (read from ram-seat).
-RAM_SEAT_HOLD="${RAM_SEAT_HOLD:-${TMPDIR:-/tmp}/ram-seat/holder}"
+# NEVER autokill these — day-to-day DAEMONS that must "stay booted" (Etan: nothing quits
+# unexpectedly): Wispr STT, the voice LLM (mlx_lm.server), ollama, and a bge-large embedder
+# daemon. Anchored to real daemon names (a bare `embed` substring was dropped — it both
+# over-protected runaways whose path merely contained "embed" AND collided with the backfill
+# reclaim pattern). A transient backfill JOB is handled by the seat + stale-reclaim path.
+HEAVY_ML_PROTECTED_PATTERN="${HEAVY_ML_PROTECTED_PATTERN:-whisper-server|mlx_lm\.server|ollama|bge-large}"
+# The RAM-seat holder is the ONE legit heavy job and is never killed. Pinned to a FIXED absolute
+# path (NOT TMPDIR, which can differ between launchd's gui domain and an interactive shell — a
+# mismatch would make the guardian blind to the seat and risk killing the seated legit job).
+# ram-seat.sh defaults to the same path; the plist also pins it.
+RAM_SEAT_HOLD="${RAM_SEAT_HOLD:-$HOME/.local/state/clx-guard/ram-seat/holder}"
 
 # Process command must match one of these to count as heavy-ML. python is gated by RSS.
 HEAVY_ML_PATTERN="${HEAVY_ML_PATTERN:-llama-server|ollama|whisper-server|[Mm]lx|[Pp]ython}"
@@ -170,8 +176,19 @@ stale_embedder_reclaim() {
   sleep "$HEAVY_ML_IDLE_SAMPLE_SLEEP"   # second sample window — confirm still idle
   while IFS=$'\t' read -r pid rss name; do
     [[ -n "$pid" ]] || continue
+    # M4: re-read the seat IMMEDIATELY before any kill — a job may have acquired the seat after
+    # the first snapshot. Never kill the (now) seated legit job.
+    if [[ "$pid" == "$(seat_holder_pid)" ]]; then
+      log "embedder pid=$pid acquired the seat between samples — SPARED (legit, never break work)"
+      continue
+    fi
+    # M2: distinguish "PID gone" (empty row) from a real idle 0.0 — a vanished PID must NOT be
+    # TERMed (PIDs recycle; we could hit an unrelated process).
     cpu2="$(ps_cpu_source | awk -v p="$pid" '$1==p { print $2; exit }')"
-    cpu2="${cpu2:-0}"
+    if [[ -z "$cpu2" ]]; then
+      log "embedder pid=$pid vanished between samples — nothing to reclaim (skip)"
+      continue
+    fi
     if awk -v c="$cpu2" -v idle="$HEAVY_ML_IDLE_CPU_PCT" 'BEGIN { exit !(c+0 <= idle) }'; then
       gb="$(awk -v k="$rss" 'BEGIN { printf "%.1f", k / 1048576 }')"
       log "RECLAIM stale embedder pid=$pid name=$name rss=${gb}GB (idle x2, non-seat, under RAM danger) — TERM"
@@ -248,6 +265,11 @@ autokill_runaways() {
   fi
   while IFS=$'\t' read -r pid rss name; do
     [[ -n "$pid" ]] || continue
+    # M4: re-read the seat right before the kill — never TERM a job that just acquired it.
+    if [[ "$pid" == "$(seat_holder_pid)" ]]; then
+      log "runaway pid=$pid acquired the seat between snapshot and kill — SPARED (legit)"
+      continue
+    fi
     gb="$(awk -v k="$rss" 'BEGIN { printf "%.1f", k / 1048576 }')"
     log "AUTOKILL runaway pid=$pid name=$name rss=${gb}GB (>=${HEAVY_ML_RUNAWAY_GB}GB, non-protected, non-seat, system in danger) — TERM"
     notify "autokill-runaway:$name(${gb}GB)" "1" "$gb" "$(vmstat_compressor_gb)"
@@ -255,9 +277,10 @@ autokill_runaways() {
     "$HEAVY_ML_KILL_BIN" -TERM "$pid" 2>/dev/null || true
     survivors="${survivors}${pid} "
   done <<<"$cand"
-  # grace, then KILL any that ignored TERM
+  # grace, then KILL any that ignored TERM (re-checking the seat once more, fail-safe)
   sleep "$HEAVY_ML_TERM_GRACE_SECONDS"
   for pid in $survivors; do
+    [[ "$pid" == "$(seat_holder_pid)" ]] && continue
     if "$HEAVY_ML_KILL_BIN" -0 "$pid" 2>/dev/null; then
       log "AUTOKILL pid=$pid survived TERM — KILL"
       "$HEAVY_ML_KILL_BIN" -KILL "$pid" 2>/dev/null || true
