@@ -23,7 +23,7 @@ set -euo pipefail
 # resolve the same seat — a TMPDIR mismatch would make the guardian blind to the seat and risk
 # killing the seated legit job. Keep this in sync with heavy-ml-guardian.sh's RAM_SEAT_HOLD.
 RAM_SEAT_DIR="${RAM_SEAT_DIR:-$HOME/.local/state/clx-guard/ram-seat}"
-RAM_SEAT_HOLD="$RAM_SEAT_DIR/holder"          # mkdir lock == the one seat
+RAM_SEAT_HOLD="${RAM_SEAT_HOLD:-$RAM_SEAT_DIR/holder}" # mkdir lock == the one seat
 RAM_SEAT_QUEUE="$RAM_SEAT_DIR/queue"          # ticket files, lexically ordered = FIFO
 RAM_SEAT_SEQLOCK="$RAM_SEAT_DIR/seq.lock"     # brief lock to allocate a ticket number
 RAM_SEAT_SEQ="$RAM_SEAT_DIR/seq"

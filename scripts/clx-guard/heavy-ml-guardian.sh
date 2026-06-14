@@ -192,7 +192,7 @@ stale_embedder_reclaim() {
     if awk -v c="$cpu2" -v idle="$HEAVY_ML_IDLE_CPU_PCT" 'BEGIN { exit !(c+0 <= idle) }'; then
       gb="$(awk -v k="$rss" 'BEGIN { printf "%.1f", k / 1048576 }')"
       log "RECLAIM stale embedder pid=$pid name=$name rss=${gb}GB (idle x2, non-seat, under RAM danger) — TERM"
-      notify "reclaim-stale-embedder:$name(${gb}GB)" "1" "$gb" "0"
+      notify "reclaim-stale-embedder:$name(${gb}GB)" "1" "$gb" "0" "killed"
       emit_clx "reclaim_stale_embedder:pid$pid:$name:${gb}GB" "1" "$gb" "0"
       "$HEAVY_ML_KILL_BIN" -TERM "$pid" 2>/dev/null || true
     else
@@ -215,11 +215,11 @@ sampler_fresh() {
 }
 
 notify() {
-  local tripped="$1" count="$2" total_gb="$3" comp_gb="$4"
+  local tripped="$1" count="$2" total_gb="$3" comp_gb="$4" action="${5:-alert-only}"
   command -v curl >/dev/null 2>&1 || return 0
   jq -cn \
     --arg title "heavy-ml-guardian" \
-    --arg body "TRIPPED: $tripped — $count heavy-ML procs, ${total_gb}GB total, compressor ${comp_gb}GB. (alert-only)" \
+    --arg body "TRIPPED: $tripped — $count heavy-ML procs, ${total_gb}GB total, compressor ${comp_gb}GB. ($action)" \
     --arg source "$HEAVY_ML_NOTIFY_SOURCE" \
     --arg priority "$HEAVY_ML_NOTIFY_PRIORITY" \
     '{title:$title,body:$body,source:$source,priority:$priority}' 2>/dev/null \
@@ -289,7 +289,7 @@ autokill_runaways() {
     fi
     gb="$(awk -v k="$rss" 'BEGIN { printf "%.1f", k / 1048576 }')"
     log "AUTOKILL runaway pid=$pid name=$name rss=${gb}GB (>=${HEAVY_ML_RUNAWAY_GB}GB, non-protected, non-seat, system in danger) — TERM"
-    notify "autokill-runaway:$name(${gb}GB)" "1" "$gb" "$(vmstat_compressor_gb)"
+    notify "autokill-runaway:$name(${gb}GB)" "1" "$gb" "$(vmstat_compressor_gb)" "killed"
     emit_clx "autokill_runaway:pid$pid:$name:${gb}GB" "1" "$gb" "0"
     "$HEAVY_ML_KILL_BIN" -TERM "$pid" 2>/dev/null || true
     survivors="${survivors}${pid} "

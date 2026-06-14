@@ -92,6 +92,17 @@ test("holder-pid reports the live holder (guardian reads this to spare the legit
   ).toBe("4242");
 });
 
+test("exported RAM_SEAT_HOLD is used unchanged", () => {
+  const dir = seatDir();
+  const hold = join(work, `explicit-holder-${n++}`);
+  mkdirSync(hold, { recursive: true });
+  writeFileSync(join(hold, "pid"), "5353");
+  const env = { ...process.env, RAM_SEAT_DIR: dir, RAM_SEAT_HOLD: hold };
+  expect(
+    execFileSync("bash", [SEAT, "holder-pid"], { env }).toString().trim(),
+  ).toBe("5353");
+});
+
 test("run records the WORKLOAD child pid as the seat holder, not the wrapper (cursor HIGH fix)", () => {
   const dir = seatDir();
   const out = join(work, `holderpid-${n++}.txt`);

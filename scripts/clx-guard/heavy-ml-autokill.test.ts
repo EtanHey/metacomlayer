@@ -121,6 +121,38 @@ test("autokill TERMs a true runaway (non-protected, >=12G) under real danger", (
   expect(killed).toContain("-TERM 7001");
 });
 
+test("autokill notification says killed when a runaway is actually killed", () => {
+  const ps = psFixture([
+    `7006 ${KB(14)} /opt/homebrew/.../python3.11 runaway_train.py`,
+  ]);
+  const curlDir = join(work, `fake-curl-${n++}`);
+  mkdirSync(curlDir, { recursive: true });
+  const curl = join(curlDir, "curl");
+  const bodyLog = join(work, `notify-${n++}.jsonl`);
+  writeFileSync(
+    curl,
+    `#!/usr/bin/env bash\ncat >> "$FAKE_CURL_BODY"\nprintf '\\n' >> "$FAKE_CURL_BODY"\nexit 0\n`,
+  );
+  chmodSync(curl, 0o755);
+
+  const { killed } = runGuardian(ps, DANGER(), {
+    PATH: `${curlDir}:${process.env.PATH ?? ""}`,
+    FAKE_CURL_BODY: bodyLog,
+    HEAVY_ML_NOTIFY_URL: "http://notify.test/notify",
+  });
+  expect(killed).toContain("-TERM 7006");
+  const bodies = readFileSync(bodyLog, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  const autokill = bodies.find((entry) =>
+    String(entry.body).includes("autokill-runaway"),
+  );
+  expect(autokill?.body).toContain("(killed)");
+  expect(autokill?.body).not.toContain("(alert-only)");
+});
+
 test("PROTECTED daemons are NEVER killed, even at 14G under danger", () => {
   const ps = psFixture([
     `7002 ${KB(14)} /opt/homebrew/bin/whisper-server -m ggml-large-v3-turbo.bin`,
