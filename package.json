@@ -5,10 +5,6 @@
   "type": "module",
   "description": "MCL — Meta-Communication Layer. Inter-agent message bus (JSON-RPC/ACP envelope + A2A headers + per-vendor adapters + delivery receipts) that STACKS ON the mcplayer transport.",
   "scripts": {
-    "clx": "bun src/clx/cli.ts",
-    "clx-boot": "bun src/boot/cli.ts",
-    "mcp-preflight": "bun src/preflight/cli.ts",
-    "stamp-perf": "bun src/perf/cli.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit --skipLibCheck"
   },
