@@ -25,7 +25,7 @@
     <key>CLX_SESSION_ID</key>
     <string>clx-guard</string>
     <key>HEAVY_ML_GUARD_ENABLE_KILL</key>
-    <string>0</string>
+    <string>1</string>
   </dict>
 
   <key>RunAtLoad</key>

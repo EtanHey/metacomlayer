@@ -81,3 +81,34 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.golems.heavy-ml-guar
 | `HEAVY_ML_SAMPLER_STALE_SECONDS` | 900 | sampler freshness window |
 | `HEAVY_ML_GUARD_ENABLE_KILL` | 0 | 1 = guarded kill all-but-largest on mutex breach |
 | `HEAVY_ML_CLX_CLI` | (unset) | e.g. `bun .../src/clx/cli.ts` to emit `local.ram.guard` events |
+
+---
+
+## Update 2026-06-14 — Etan ruling (autokill + RAM-seat queue + ownership resolved)
+
+> Etan, verbatim: *"Control layer needs to do the best while not breaking things ever. I don't
+> want anything quitting on me unexpectedly. But I also want them to keep working. I want
+> everything fixed."*
+
+### Guarded autokill — now ON, TRUE RUNAWAYS ONLY
+`HEAVY_ML_GUARD_ENABLE_KILL=1` by default. A proc is killed only when **all** hold:
+- RSS ≥ `HEAVY_ML_RUNAWAY_GB` (default 12) — pathologically large, AND
+- command does **not** match `HEAVY_ML_PROTECTED_PATTERN` (`whisper-server|mlx_lm.server|ollama|bge-large|embed` — day-to-day holders stay booted), AND
+- it is **not** the RAM-seat holder (the one legit heavy job), AND
+- the system is in **real danger** (compressor or aggregate over threshold — not a bare mutex/stale signal).
+
+Legit work, the seat holder, and day-to-day daemons are **never** killed; every kill is announced via Telegram + `clx emit` (never silent). This is how "autokill yes, but nothing quits unexpectedly" is satisfied: legit heavy work runs under the seat (protected); only un-seated, non-protected, pathological procs under genuine danger are reaped.
+
+### `ram-seat.sh` — sequential RAM seat (the queue)
+Heavy BATCH jobs run **one at a time**, FIFO:
+```
+ram-seat.sh run reembed -- python reembed_backfill.py --all
+ram-seat.sh status      # holder + queue depth
+```
+Day-to-day holders (embedder daemon, voice STT/LLM, Wispr) do **not** use the seat — they stay booted. Only transient heavy jobs queue. The guardian reads the seat holder PID and never autokills it. Dead holders/tickets auto-reclaim (a crashed job never wedges the queue).
+
+### Canonical-copy decision — RESOLVED (I owned it, per Etan's "don't wait on me")
+- **clx-guard (this dir, metacomlayer) = canonical for the WHOLE-SYSTEM RAM guardrail**: process-agnostic heavy-ML watch (the non-cmux blind spot), sampler-freshness self-check, autokill, and the RAM-seat queue. Shipped + live.
+- **cmuxlayer `cmux-memory-watchdog` stays canonical for the cmux-SPECIFIC footprint watch** (it is the live launchd job, #153, dual-bundle). clx-guard does **not** duplicate it — they are complementary layers, so there is no fork to resolve between them.
+- **The `~/Gits/systems` copy of the watchdog is superseded** (inferior single-bundle fork per clx-03) — abandon it.
+- **Handed to the cmuxlayer lead** (their repo, their live WIP — no clobber): fold the real-16K-page-size compressor fix + a descendant/top-offender guard into the cmuxlayer watchdog, and archive the systems fork.
