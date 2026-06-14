@@ -32,6 +32,17 @@ function vmstat(compressorPages: number): string {
   );
   return p;
 }
+function vmstatWithWired(compressorPages: number, wiredPages: number): string {
+  const p = join(work, `vmstat-wired-${compressorPages}-${wiredPages}.txt`);
+  writeFileSync(
+    p,
+    `Mach Virtual Memory Statistics: (page size of 16384 bytes)\n` +
+      `Pages free:                          100000.\n` +
+      `Pages wired down:                    ${wiredPages}.\n` +
+      `Pages occupied by compressor:        ${compressorPages}.\n`,
+  );
+  return p;
+}
 function hash(s: string): number {
   let h = 0;
   for (let i = 0; i < s.length; i++)
@@ -68,6 +79,11 @@ function safeMem(): string {
     p,
     `The system has memory.\nSystem-wide memory free percentage: 95%\n`,
   );
+  return p;
+}
+function unreadableMem(): string {
+  const p = join(work, "mem-unreadable.txt");
+  writeFileSync(p, `memory pressure unavailable\n`);
   return p;
 }
 function safeSwap(): string {
@@ -154,6 +170,31 @@ test("compressor over threshold trips (real 16K page size)", () => {
   });
   expect(Number(r.compressor_gb)).toBeGreaterThan(12);
   expect(r.tripped).toContain("compressor");
+});
+
+test("wired memory over threshold trips wired_high and reports wired_gb", () => {
+  // 1,600,000 pages * 16384 = ~24.4GB > default 22GB wired danger threshold
+  const ps = psFixture([`1003 ${KB(5)} /opt/homebrew/bin/llama-server`]);
+  const r = runGuardian({
+    HEAVY_ML_PS_FIXTURE: ps,
+    HEAVY_ML_VMSTAT_FIXTURE: vmstatWithWired(100000, 1600000),
+    ...freshEnv(),
+  });
+  expect(Number(r.wired_gb)).toBeGreaterThan(22);
+  expect(r.wired_high).toBe(1);
+  expect(r.tripped).toContain("wired_high");
+});
+
+test("unreadable free RAM fails closed as low_free_ram danger", () => {
+  const ps = psFixture([`1003 ${KB(5)} /opt/homebrew/bin/llama-server`]);
+  const r = runGuardian({
+    HEAVY_ML_PS_FIXTURE: ps,
+    HEAVY_ML_VMSTAT_FIXTURE: lowCompressor(),
+    HEAVY_ML_MEMPRESSURE_FIXTURE: unreadableMem(),
+    ...freshEnv(),
+  });
+  expect(r.free_ram_pct).toBe(0);
+  expect(r.tripped).toContain("low_free_ram");
 });
 
 test("stale sampler trips sampler_stale (the Jun-11 silent-death case)", () => {

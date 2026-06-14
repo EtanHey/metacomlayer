@@ -17,6 +17,7 @@
 #   heavy_ml_mutex      — more than HEAVY_ML_MUTEX_MAX_SLOTS heavy-ML procs resident
 #   heavy_ml_aggregate  — total heavy-ML footprint > HEAVY_ML_AGG_DANGER_GB
 #   compressor          — VM compressor > HEAVY_ML_COMPRESSOR_DANGER_GB (real page size)
+#   wired_high          — wired memory > HEAVY_ML_WIRED_DANGER_GB (alert-only)
 #   sampler_stale       — cmux-ram-sampler samples.jsonl older than HEAVY_ML_SAMPLER_STALE_SECONDS
 #
 # Side effects on trip: JSON status to stdout (always), Telegram notify, optional clx
@@ -28,6 +29,7 @@ HEAVY_ML_MIN_GB="${HEAVY_ML_MIN_GB:-3}"                       # a proc counts as
 HEAVY_ML_MUTEX_MAX_SLOTS="${HEAVY_ML_MUTEX_MAX_SLOTS:-1}"     # single-heavy-ML-slot mutex
 HEAVY_ML_AGG_DANGER_GB="${HEAVY_ML_AGG_DANGER_GB:-24}"        # aggregate ML footprint danger (of 36GB)
 HEAVY_ML_COMPRESSOR_DANGER_GB="${HEAVY_ML_COMPRESSOR_DANGER_GB:-12}"
+HEAVY_ML_WIRED_DANGER_GB="${HEAVY_ML_WIRED_DANGER_GB:-22}"    # wired/GPU/Metal/kernel memory danger (alert-only)
 HEAVY_ML_SAMPLE_FILE="${HEAVY_ML_SAMPLE_FILE:-$HOME/Library/Logs/cmux-ram-sampler/samples.jsonl}"
 HEAVY_ML_SAMPLER_STALE_SECONDS="${HEAVY_ML_SAMPLER_STALE_SECONDS:-900}"   # sampler runs every 300s; 900s = dead
 HEAVY_ML_NOTIFY_URL="${HEAVY_ML_NOTIFY_URL:-http://localhost:3847/notify}"
@@ -99,18 +101,41 @@ heavy_procs() {
     }'
 }
 
+vmstat_output() {
+  if [[ -n "${HEAVY_ML_VMSTAT_FIXTURE:-}" ]]; then
+    cat "$HEAVY_ML_VMSTAT_FIXTURE" 2>/dev/null || true
+  else
+    vm_stat 2>/dev/null || true
+  fi
+}
+
+vmstat_pagesize() {
+  local out="$1" pagesize
+  pagesize="$(printf '%s\n' "$out" | awk '/page size of/ { for (i=1;i<=NF;i++) if ($i=="of") { print $(i+1); exit } }')"
+  pagesize="$(printf '%s' "$pagesize" | tr -cd '0-9')"
+  if [[ -z "$pagesize" ]]; then
+    pagesize="$(sysctl -n vm.pagesize 2>/dev/null || true)"
+  fi
+  pagesize="${pagesize:-16384}"
+  printf '%s\n' "$pagesize"
+}
+
 # Real page size from vm_stat header (Apple Silicon is 16384, NOT 4096 — the cmux
 # sampler/watchdog hardcode 4096 and under-report compressor 4x).
 vmstat_compressor_gb() {
   local out pages pagesize
-  if [[ -n "${HEAVY_ML_VMSTAT_FIXTURE:-}" ]]; then
-    out="$(cat "$HEAVY_ML_VMSTAT_FIXTURE")"
-  else
-    out="$(vm_stat 2>/dev/null || true)"
-  fi
-  pagesize="$(printf '%s\n' "$out" | awk '/page size of/ { for (i=1;i<=NF;i++) if ($i=="of") { print $(i+1); exit } }')"
-  pagesize="${pagesize:-16384}"
+  out="$(vmstat_output)"
+  pagesize="$(vmstat_pagesize "$out")"
   pages="$(printf '%s\n' "$out" | awk '/Pages occupied by compressor/ { gsub(/\./,"",$NF); print $NF }')"
+  pages="${pages:-0}"
+  awk -v p="$pages" -v ps="$pagesize" 'BEGIN { printf "%.2f", p * ps / (1024 * 1024 * 1024) }'
+}
+
+vmstat_wired_gb() {
+  local out pages pagesize
+  out="$(vmstat_output)"
+  pagesize="$(vmstat_pagesize "$out")"
+  pages="$(printf '%s\n' "$out" | awk '/Pages wired down/ { gsub(/\./,"",$NF); print $NF }')"
   pages="${pages:-0}"
   awk -v p="$pages" -v ps="$pagesize" 'BEGIN { printf "%.2f", p * ps / (1024 * 1024 * 1024) }'
 }
@@ -119,11 +144,16 @@ vmstat_compressor_gb() {
 free_ram_pct() {
   local out
   if [[ -n "${HEAVY_ML_MEMPRESSURE_FIXTURE:-}" ]]; then
-    out="$(cat "$HEAVY_ML_MEMPRESSURE_FIXTURE")"
+    out="$(cat "$HEAVY_ML_MEMPRESSURE_FIXTURE" 2>/dev/null || true)"
   else
     out="$(memory_pressure 2>/dev/null || true)"
   fi
-  printf '%s\n' "$out" | awk '/free percentage/ { for (i=1;i<=NF;i++) if ($i ~ /%/) { gsub(/%/,"",$i); print int($i); exit } }'
+  printf '%s\n' "$out" | awk '
+    /free percentage/ {
+      for (i=1;i<=NF;i++) if ($i ~ /%/) { gsub(/%/,"",$i); print int($i); found=1; exit }
+    }
+    END { if (!found) print 0 }
+  '
 }
 
 # swap used %, from `sysctl vm.swapusage` (or a fixture). Echoes an integer (0 if no swap).
@@ -306,7 +336,7 @@ autokill_runaways() {
 }
 
 run_once() {
-  local ts procs count total_kb total_gb fresh comp_gb free_pct swap_pct tripped="" danger=0
+  local ts procs count total_kb total_gb fresh comp_gb wired_gb wired_high=0 free_pct swap_pct tripped="" danger=0
   ts="$(date '+%Y-%m-%dT%H:%M:%S%z')"
   procs="$(heavy_procs || true)"
   count="$(printf '%s' "$procs" | awk 'NF' | wc -l | tr -d ' ')"
@@ -314,21 +344,23 @@ run_once() {
   total_gb="$(awk -v k="${total_kb:-0}" 'BEGIN { printf "%.2f", k / (1024 * 1024) }')"
   fresh="$(sampler_fresh)"
   comp_gb="$(vmstat_compressor_gb)"
-  free_pct="$(free_ram_pct)"; free_pct="${free_pct:-100}"
+  wired_gb="$(vmstat_wired_gb)"
+  free_pct="$(free_ram_pct)"; free_pct="${free_pct:-0}"
   swap_pct="$(swap_used_pct)"; swap_pct="${swap_pct:-0}"
 
   (( count > HEAVY_ML_MUTEX_MAX_SLOTS )) && tripped="${tripped}${tripped:+,}heavy_ml_mutex"
   if awk -v a="$total_gb" -v d="$HEAVY_ML_AGG_DANGER_GB" 'BEGIN { exit !(a > d) }'; then tripped="${tripped}${tripped:+,}heavy_ml_aggregate"; danger=1; fi
   if awk -v c="$comp_gb" -v d="$HEAVY_ML_COMPRESSOR_DANGER_GB" 'BEGIN { exit !(c > d) }'; then tripped="${tripped}${tripped:+,}compressor"; danger=1; fi
+  if awk -v w="$wired_gb" -v d="$HEAVY_ML_WIRED_DANGER_GB" 'BEGIN { exit !(w > d) }'; then tripped="${tripped}${tripped:+,}wired_high"; wired_high=1; fi
   if (( free_pct < HEAVY_ML_FREE_RAM_DANGER_PCT )); then tripped="${tripped}${tripped:+,}low_free_ram"; danger=1; fi
   if (( swap_pct > HEAVY_ML_SWAP_DANGER_PCT )); then tripped="${tripped}${tripped:+,}swap_high"; danger=1; fi
   [[ "$fresh" == "1" ]] || tripped="${tripped}${tripped:+,}sampler_stale"
 
-  printf '{"ts":"%s","heavy_ml_count":%s,"heavy_ml_total_gb":%s,"sampler_fresh":%s,"compressor_gb":%s,"free_ram_pct":%s,"swap_pct":%s,"tripped":"%s"}\n' \
-    "$ts" "${count:-0}" "${total_gb:-0}" "${fresh:-0}" "${comp_gb:-0}" "${free_pct}" "${swap_pct}" "$tripped"
+  printf '{"ts":"%s","heavy_ml_count":%s,"heavy_ml_total_gb":%s,"sampler_fresh":%s,"compressor_gb":%s,"wired_gb":%s,"wired_high":%s,"free_ram_pct":%s,"swap_pct":%s,"tripped":"%s"}\n' \
+    "$ts" "${count:-0}" "${total_gb:-0}" "${fresh:-0}" "${comp_gb:-0}" "${wired_gb:-0}" "$wired_high" "${free_pct}" "${swap_pct}" "$tripped"
 
   if [[ -n "$tripped" ]]; then
-    log "TRIPPED: $tripped (heavy_ml_count=$count total=${total_gb}GB compressor=${comp_gb}GB free_ram=${free_pct}% swap=${swap_pct}% sampler_fresh=$fresh)"
+    log "TRIPPED: $tripped (heavy_ml_count=$count total=${total_gb}GB compressor=${comp_gb}GB wired=${wired_gb}GB free_ram=${free_pct}% swap=${swap_pct}% sampler_fresh=$fresh)"
     [[ -n "$procs" ]] && { log "heavy-ML procs (pid/rss_kb/name):"; printf '%s\n' "$procs" >&2; }
     notify "$tripped" "$count" "$total_gb" "$comp_gb"
     emit_clx "$tripped" "$count" "$total_gb" "$comp_gb"
