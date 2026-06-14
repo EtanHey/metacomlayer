@@ -60,12 +60,31 @@ function tsEpoch(): number {
   return parseInt(out, 10);
 }
 
+function safeMem(): string {
+  const p = join(work, "mem-safe.txt");
+  writeFileSync(
+    p,
+    `The system has memory.\nSystem-wide memory free percentage: 95%\n`,
+  );
+  return p;
+}
+function safeSwap(): string {
+  const p = join(work, "swap-safe.txt");
+  writeFileSync(
+    p,
+    `vm.swapusage: total = 4096.00M  used = 0.00M  free = 4096.00M  (encrypted)\n`,
+  );
+  return p;
+}
+
 function runGuardian(env: Record<string, string>): any {
   const base: Record<string, string> = {
     ...process.env,
     HEAVY_ML_NOTIFY_URL: "http://127.0.0.1:9/notify", // unreachable: no real telegram during tests
     HEAVY_ML_CLX_CLI: "", // no clx emit during tests
     HEAVY_ML_GUARD_ENABLE_KILL: "0",
+    HEAVY_ML_MEMPRESSURE_FIXTURE: safeMem(), // deterministic: free RAM healthy
+    HEAVY_ML_SWAP_FIXTURE: safeSwap(), // deterministic: no swap
   };
   const out = execFileSync("bash", [GUARDIAN], { env: { ...base, ...env } })
     .toString()

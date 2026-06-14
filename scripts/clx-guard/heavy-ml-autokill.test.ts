@@ -46,6 +46,29 @@ function vmstat(pages: number): string {
 const DANGER = () => vmstat(1_000_000); // ~15.3GB > 12GB compressor danger
 const SAFE = () => vmstat(50_000); // ~0.8GB
 
+// deterministic free-RAM / swap fixtures (default safe; override to simulate the RAM alert)
+function mem(freePct: number): string {
+  const p = join(work, `mem-${freePct}-${n++}.txt`);
+  writeFileSync(p, `System-wide memory free percentage: ${freePct}%\n`);
+  return p;
+}
+function swap(usedM: number, totalM = 4096): string {
+  const p = join(work, `swap-${usedM}-${n++}.txt`);
+  writeFileSync(
+    p,
+    `vm.swapusage: total = ${totalM}.00M  used = ${usedM}.00M  free = ${totalM - usedM}.00M  (encrypted)\n`,
+  );
+  return p;
+}
+const MEM_SAFE = () => mem(95);
+const SWAP_SAFE = () => swap(0);
+// pid %cpu rss(KB) command
+function psCpuFixture(lines: string[]): string {
+  const p = join(work, `pscpu-${n++}.txt`);
+  writeFileSync(p, lines.join("\n") + "\n");
+  return p;
+}
+
 // a fresh sample so sampler_stale doesn't fire (unless we want it to)
 const SAMPLE_TS = "2026-06-14T09:00:00+0300";
 function freshSample() {
@@ -75,6 +98,9 @@ function runGuardian(ps: string, vm: string, extra: Record<string, string>) {
     HEAVY_ML_GUARD_ENABLE_KILL: "1",
     HEAVY_ML_KILL_BIN: FAKE_KILL,
     HEAVY_ML_TERM_GRACE_SECONDS: "0",
+    HEAVY_ML_IDLE_SAMPLE_SLEEP: "0",
+    HEAVY_ML_MEMPRESSURE_FIXTURE: MEM_SAFE(),
+    HEAVY_ML_SWAP_FIXTURE: SWAP_SAFE(),
     FAKE_KILL_LOG: log,
     RAM_SEAT_HOLD: seat,
     ...extra,
@@ -146,6 +172,8 @@ test("NO kill when system is NOT in danger (only sampler_stale), even with a 14G
     HEAVY_ML_GUARD_ENABLE_KILL: "1",
     HEAVY_ML_KILL_BIN: FAKE_KILL,
     HEAVY_ML_TERM_GRACE_SECONDS: "0",
+    HEAVY_ML_MEMPRESSURE_FIXTURE: MEM_SAFE(),
+    HEAVY_ML_SWAP_FIXTURE: SWAP_SAFE(),
     FAKE_KILL_LOG: log,
     RAM_SEAT_HOLD: join(work, "noseat"),
     HEAVY_ML_AGG_DANGER_GB: "24", // 14 < 24 so no aggregate danger either
@@ -162,4 +190,84 @@ test("a heavy proc BELOW the runaway size is spared even under danger", () => {
   ]);
   const { killed } = runGuardian(ps, DANGER(), { HEAVY_ML_RUNAWAY_GB: "12" });
   expect(killed).toBe("");
+});
+
+// --- free-RAM / swap danger (the gen-16 RAM-alert profile) ---
+
+test("low free RAM trips low_free_ram danger (compressor stayed low)", () => {
+  const ps = psFixture([`8001 ${KB(2)} /opt/homebrew/bin/ollama serve`]);
+  const { out } = runGuardian(ps, SAFE(), {
+    HEAVY_ML_MEMPRESSURE_FIXTURE: mem(3), // 3% free < 8% danger
+  });
+  expect(out).toContain("low_free_ram");
+});
+
+test("high swap trips swap_high danger", () => {
+  const ps = psFixture([`8002 ${KB(2)} /opt/homebrew/bin/ollama serve`]);
+  const { out } = runGuardian(ps, SAFE(), {
+    HEAVY_ML_SWAP_FIXTURE: swap(3800), // 3800/4096 = 92% > 80% danger
+  });
+  expect(out).toContain("swap_high");
+});
+
+// --- stale-embedder reclaim (safe: idle, double-sampled, never voice) ---
+
+test("a STALE idle embedder is reclaimed under danger (double-sampled)", () => {
+  const ps = psFixture([
+    `8100 ${KB(3)} /opt/.../python3.11 reembed_backfill.py`,
+  ]); // protected from runaway
+  const psCpu = psCpuFixture([
+    `8100 0.0 ${KB(3)} /opt/.../python3.11 reembed_backfill.py`,
+  ]); // idle
+  const { killed } = runGuardian(ps, SAFE(), {
+    HEAVY_ML_MEMPRESSURE_FIXTURE: mem(4), // danger via low free RAM
+    HEAVY_ML_PS_CPU_FIXTURE: psCpu,
+  });
+  expect(killed).toContain("-TERM 8100");
+});
+
+test("an ACTIVE embedder (CPU busy) is SPARED even under danger", () => {
+  const ps = psFixture([
+    `8101 ${KB(3)} /opt/.../python3.11 reembed_backfill.py`,
+  ]);
+  const psCpu = psCpuFixture([
+    `8101 99.0 ${KB(3)} /opt/.../python3.11 reembed_backfill.py`,
+  ]); // working
+  const { killed, out } = runGuardian(ps, SAFE(), {
+    HEAVY_ML_MEMPRESSURE_FIXTURE: mem(4),
+    HEAVY_ML_PS_CPU_FIXTURE: psCpu,
+  });
+  expect(killed).toBe(""); // never break working embedder
+});
+
+test("an idle VOICE daemon (mlx_lm.server) is NOT reclaimed by the stale path", () => {
+  const ps = psFixture([
+    `8102 ${KB(3)} /Library/.../Python mlx_lm.server --model x`,
+  ]);
+  const psCpu = psCpuFixture([
+    `8102 0.0 ${KB(3)} /Library/.../Python mlx_lm.server --model x`,
+  ]); // idle but voice
+  const { killed } = runGuardian(ps, SAFE(), {
+    HEAVY_ML_MEMPRESSURE_FIXTURE: mem(4),
+    HEAVY_ML_PS_CPU_FIXTURE: psCpu,
+  });
+  expect(killed).toBe(""); // voice stays booted even when idle
+});
+
+test("the seat-held embedder is NOT reclaimed even if idle", () => {
+  const ps = psFixture([
+    `8103 ${KB(3)} /opt/.../python3.11 reembed_backfill.py`,
+  ]);
+  const psCpu = psCpuFixture([
+    `8103 0.0 ${KB(3)} /opt/.../python3.11 reembed_backfill.py`,
+  ]);
+  const seat = join(work, `seat-held-${n++}`);
+  mkdirSync(seat, { recursive: true });
+  writeFileSync(join(seat, "pid"), "8103");
+  const { killed } = runGuardian(ps, SAFE(), {
+    HEAVY_ML_MEMPRESSURE_FIXTURE: mem(4),
+    HEAVY_ML_PS_CPU_FIXTURE: psCpu,
+    RAM_SEAT_HOLD: seat,
+  });
+  expect(killed).toBe(""); // the legit queued job is protected
 });

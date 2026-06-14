@@ -39,8 +39,24 @@ HEAVY_ML_RUNAWAY_GB="${HEAVY_ML_RUNAWAY_GB:-12}"             # a non-seat, non-p
 HEAVY_ML_KILL_BIN="${HEAVY_ML_KILL_BIN:-kill}"
 HEAVY_ML_TERM_GRACE_SECONDS="${HEAVY_ML_TERM_GRACE_SECONDS:-8}"
 
+# Free-RAM / swap danger (the gen-16 RAM-alert profile: free RAM cratered + swap climbed while
+# the compressor stayed low — the compressor-only check missed it). System in danger if free
+# system memory drops below FREE_RAM_DANGER_PCT or swap used climbs above SWAP_DANGER_PCT.
+HEAVY_ML_FREE_RAM_DANGER_PCT="${HEAVY_ML_FREE_RAM_DANGER_PCT:-8}"
+HEAVY_ML_SWAP_DANGER_PCT="${HEAVY_ML_SWAP_DANGER_PCT:-80}"
+
+# Stale-embedder reclaim: a BACKFILL/embedder job (NOT the voice daemons) that is IDLE
+# (double-sampled CPU) and holding RAM under danger is a stale orphan — safe to reclaim
+# (Etan/weaver 2026-06-14: "if a stale/idle embedder is holding RAM, reclaim it; else throttle").
+HEAVY_ML_EMBEDDER_PATTERN="${HEAVY_ML_EMBEDDER_PATTERN:-bge-large|reembed|embed_backfill|embed-backfill|embed_pending|embed_backlog}"
+HEAVY_ML_EMBEDDER_RECLAIM_GB="${HEAVY_ML_EMBEDDER_RECLAIM_GB:-2}"
+HEAVY_ML_IDLE_CPU_PCT="${HEAVY_ML_IDLE_CPU_PCT:-5}"            # <= this %CPU on BOTH samples = idle
+HEAVY_ML_IDLE_SAMPLE_SLEEP="${HEAVY_ML_IDLE_SAMPLE_SLEEP:-2}" # gap between the two CPU samples
+
 # NEVER autokill these — day-to-day holders that must "stay booted" (Etan: nothing quits
-# unexpectedly). Wispr STT, the voice LLM, ollama, and the embedder daemon are protected.
+# unexpectedly). Wispr STT, the voice LLM (mlx_lm.server), ollama, and an actively-working
+# embedder (bge/embed) are protected from the blunt runaway-kill. An IDLE/stale embedder is
+# reclaimed only via the careful double-sampled stale_embedder_reclaim path below.
 HEAVY_ML_PROTECTED_PATTERN="${HEAVY_ML_PROTECTED_PATTERN:-whisper-server|mlx_lm\.server|ollama|bge-large|embed}"
 # The RAM-seat holder is the ONE legit heavy job and is never killed (read from ram-seat).
 RAM_SEAT_HOLD="${RAM_SEAT_HOLD:-${TMPDIR:-/tmp}/ram-seat/holder}"
@@ -91,6 +107,82 @@ vmstat_compressor_gb() {
   pages="$(printf '%s\n' "$out" | awk '/Pages occupied by compressor/ { gsub(/\./,"",$NF); print $NF }')"
   pages="${pages:-0}"
   awk -v p="$pages" -v ps="$pagesize" 'BEGIN { printf "%.2f", p * ps / (1024 * 1024 * 1024) }'
+}
+
+# free system memory %, from `memory_pressure` (or a fixture). Echoes an integer.
+free_ram_pct() {
+  local out
+  if [[ -n "${HEAVY_ML_MEMPRESSURE_FIXTURE:-}" ]]; then
+    out="$(cat "$HEAVY_ML_MEMPRESSURE_FIXTURE")"
+  else
+    out="$(memory_pressure 2>/dev/null || true)"
+  fi
+  printf '%s\n' "$out" | awk '/free percentage/ { for (i=1;i<=NF;i++) if ($i ~ /%/) { gsub(/%/,"",$i); print int($i); exit } }'
+}
+
+# swap used %, from `sysctl vm.swapusage` (or a fixture). Echoes an integer (0 if no swap).
+swap_used_pct() {
+  local out
+  if [[ -n "${HEAVY_ML_SWAP_FIXTURE:-}" ]]; then
+    out="$(cat "$HEAVY_ML_SWAP_FIXTURE")"
+  else
+    out="$(sysctl vm.swapusage 2>/dev/null || true)"
+  fi
+  printf '%s\n' "$out" | awk '
+    { total=0; used=0;
+      for (i=1;i<=NF;i++) {
+        if ($i=="total") { v=$(i+2); gsub(/M/,"",v); total=v }
+        if ($i=="used")  { v=$(i+2); gsub(/M/,"",v); used=v }
+      }
+      if (total+0 > 0) printf "%d\n", (used/total)*100; else print 0
+    }'
+}
+
+# pid %cpu rss(KB) command — used by stale_embedder_reclaim (needs %CPU). Fixture-able.
+ps_cpu_source() {
+  if [[ -n "${HEAVY_ML_PS_CPU_FIXTURE:-}" ]]; then
+    cat "$HEAVY_ML_PS_CPU_FIXTURE"
+  else
+    ps -axo pid=,%cpu=,rss=,command=
+  fi
+}
+
+# Reclaim STALE (idle) embedder/backfill procs under danger. Double-samples %CPU so an
+# embedder that is merely between batches (briefly 0%) is NOT killed — only one idle on BOTH
+# samples. Never touches the voice daemons (they don't match the embedder pattern) or the
+# RAM-seat holder. Every reclaim announced. This is the "reclaim stale embedder, else throttle"
+# rule, done safely.
+stale_embedder_reclaim() {
+  local reclaim_kb seat_pid cand pid cpu rss name cpu2 gb
+  reclaim_kb="$(awk -v g="$HEAVY_ML_EMBEDDER_RECLAIM_GB" 'BEGIN { printf "%.0f", g * 1024 * 1024 }')"
+  seat_pid="$(seat_holder_pid)"
+  # first sample: embedder-pattern, >= reclaim floor, idle, not seat-held, not a voice daemon
+  cand="$(ps_cpu_source | awk -v min="$reclaim_kb" -v epat="$HEAVY_ML_EMBEDDER_PATTERN" \
+            -v idle="$HEAVY_ML_IDLE_CPU_PCT" -v seat="${seat_pid:-0}" -v vpat="whisper-server|mlx_lm\\.server" '
+    {
+      pid=$1; cpu=$2; rss=$3; cmd=$0;
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9.]+[[:space:]]+[0-9]+[[:space:]]+/, "", cmd);
+      if (rss+0 >= min && cmd ~ epat && cmd !~ vpat && cpu+0 <= idle && pid != seat) {
+        name=cmd; sub(/[[:space:]].*/,"",name); printf "%s\t%s\t%s\n", pid, rss, name;
+      }
+    }')"
+  [[ -n "$cand" ]] || return 0
+  sleep "$HEAVY_ML_IDLE_SAMPLE_SLEEP"   # second sample window — confirm still idle
+  while IFS=$'\t' read -r pid rss name; do
+    [[ -n "$pid" ]] || continue
+    cpu2="$(ps_cpu_source | awk -v p="$pid" '$1==p { print $2; exit }')"
+    cpu2="${cpu2:-0}"
+    if awk -v c="$cpu2" -v idle="$HEAVY_ML_IDLE_CPU_PCT" 'BEGIN { exit !(c+0 <= idle) }'; then
+      gb="$(awk -v k="$rss" 'BEGIN { printf "%.1f", k / 1048576 }')"
+      log "RECLAIM stale embedder pid=$pid name=$name rss=${gb}GB (idle x2, non-seat, under RAM danger) — TERM"
+      notify "reclaim-stale-embedder:$name(${gb}GB)" "1" "$gb" "0"
+      emit_clx "reclaim_stale_embedder:pid$pid:$name:${gb}GB" "1" "$gb" "0"
+      "$HEAVY_ML_KILL_BIN" -TERM "$pid" 2>/dev/null || true
+    else
+      log "embedder pid=$pid resumed work (cpu=$cpu2%) between samples — SPARED (legit, never break work)"
+    fi
+  done <<<"$cand"
+  return 0
 }
 
 # echo 1 if the sampler file has a fresh trailing ts, else 0
@@ -174,7 +266,7 @@ autokill_runaways() {
 }
 
 run_once() {
-  local ts procs count total_kb total_gb fresh comp_gb tripped=""
+  local ts procs count total_kb total_gb fresh comp_gb free_pct swap_pct tripped="" danger=0
   ts="$(date '+%Y-%m-%dT%H:%M:%S%z')"
   procs="$(heavy_procs || true)"
   count="$(printf '%s' "$procs" | awk 'NF' | wc -l | tr -d ' ')"
@@ -182,24 +274,29 @@ run_once() {
   total_gb="$(awk -v k="${total_kb:-0}" 'BEGIN { printf "%.2f", k / (1024 * 1024) }')"
   fresh="$(sampler_fresh)"
   comp_gb="$(vmstat_compressor_gb)"
+  free_pct="$(free_ram_pct)"; free_pct="${free_pct:-100}"
+  swap_pct="$(swap_used_pct)"; swap_pct="${swap_pct:-0}"
 
   (( count > HEAVY_ML_MUTEX_MAX_SLOTS )) && tripped="${tripped}${tripped:+,}heavy_ml_mutex"
-  awk -v a="$total_gb" -v d="$HEAVY_ML_AGG_DANGER_GB" 'BEGIN { exit !(a > d) }' && tripped="${tripped}${tripped:+,}heavy_ml_aggregate"
-  awk -v c="$comp_gb" -v d="$HEAVY_ML_COMPRESSOR_DANGER_GB" 'BEGIN { exit !(c > d) }' && tripped="${tripped}${tripped:+,}compressor"
+  if awk -v a="$total_gb" -v d="$HEAVY_ML_AGG_DANGER_GB" 'BEGIN { exit !(a > d) }'; then tripped="${tripped}${tripped:+,}heavy_ml_aggregate"; danger=1; fi
+  if awk -v c="$comp_gb" -v d="$HEAVY_ML_COMPRESSOR_DANGER_GB" 'BEGIN { exit !(c > d) }'; then tripped="${tripped}${tripped:+,}compressor"; danger=1; fi
+  if (( free_pct < HEAVY_ML_FREE_RAM_DANGER_PCT )); then tripped="${tripped}${tripped:+,}low_free_ram"; danger=1; fi
+  if (( swap_pct > HEAVY_ML_SWAP_DANGER_PCT )); then tripped="${tripped}${tripped:+,}swap_high"; danger=1; fi
   [[ "$fresh" == "1" ]] || tripped="${tripped}${tripped:+,}sampler_stale"
 
-  printf '{"ts":"%s","heavy_ml_count":%s,"heavy_ml_total_gb":%s,"sampler_fresh":%s,"compressor_gb":%s,"tripped":"%s"}\n' \
-    "$ts" "${count:-0}" "${total_gb:-0}" "${fresh:-0}" "${comp_gb:-0}" "$tripped"
+  printf '{"ts":"%s","heavy_ml_count":%s,"heavy_ml_total_gb":%s,"sampler_fresh":%s,"compressor_gb":%s,"free_ram_pct":%s,"swap_pct":%s,"tripped":"%s"}\n' \
+    "$ts" "${count:-0}" "${total_gb:-0}" "${fresh:-0}" "${comp_gb:-0}" "${free_pct}" "${swap_pct}" "$tripped"
 
   if [[ -n "$tripped" ]]; then
-    log "TRIPPED: $tripped (heavy_ml_count=$count total=${total_gb}GB compressor=${comp_gb}GB sampler_fresh=$fresh)"
+    log "TRIPPED: $tripped (heavy_ml_count=$count total=${total_gb}GB compressor=${comp_gb}GB free_ram=${free_pct}% swap=${swap_pct}% sampler_fresh=$fresh)"
     [[ -n "$procs" ]] && { log "heavy-ML procs (pid/rss_kb/name):"; printf '%s\n' "$procs" >&2; }
     notify "$tripped" "$count" "$total_gb" "$comp_gb"
     emit_clx "$tripped" "$count" "$total_gb" "$comp_gb"
-    # Autokill ONLY under REAL memory danger (compressor or aggregate over threshold) — never
-    # on a bare mutex/stale signal. And only TRUE runaways (autokill_runaways protects legit
-    # work + the seat holder + day-to-day daemons).
-    if [[ "$HEAVY_ML_GUARD_ENABLE_KILL" == "1" && ( "$tripped" == *compressor* || "$tripped" == *heavy_ml_aggregate* ) ]]; then
+    # Under REAL memory danger (compressor/aggregate/low-free-RAM/swap-high — NOT a bare
+    # mutex/stale signal): first reclaim STALE idle embedders (safe, double-sampled), then
+    # autokill TRUE runaways. Both protect legit work, the seat holder, and voice daemons.
+    if [[ "$HEAVY_ML_GUARD_ENABLE_KILL" == "1" && "$danger" == "1" ]]; then
+      stale_embedder_reclaim
       autokill_runaways
     fi
   fi
