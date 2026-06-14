@@ -45,6 +45,16 @@ function vmstat(pages: number): string {
   );
   return p;
 }
+function vmstatWithWired(compressorPages: number, wiredPages: number): string {
+  const p = join(work, `vm-wired-${compressorPages}-${wiredPages}-${n++}.txt`);
+  writeFileSync(
+    p,
+    `Mach Virtual Memory Statistics: (page size of 16384 bytes)\n` +
+      `Pages wired down:                    ${wiredPages}.\n` +
+      `Pages occupied by compressor:        ${compressorPages}.\n`,
+  );
+  return p;
+}
 const DANGER = () => vmstat(1_000_000); // ~15.3GB > 12GB compressor danger
 const SAFE = () => vmstat(50_000); // ~0.8GB
 
@@ -215,6 +225,15 @@ test("NO kill when system is NOT in danger (only sampler_stale), even with a 14G
   const out = execFileSync("bash", [GUARDIAN], { env }).toString();
   expect(out).toContain("sampler_stale");
   expect(existsSync(log) ? readFileSync(log, "utf8").trim() : "").toBe(""); // danger-gated -> no kill
+});
+
+test("wired-only danger alerts but does not autokill a true runaway", () => {
+  const ps = psFixture([`7007 ${KB(14)} /opt/homebrew/.../python3.11 big.py`]);
+  const { killed, out } = runGuardian(ps, vmstatWithWired(50_000, 1_600_000), {
+    HEAVY_ML_AGG_DANGER_GB: "24",
+  });
+  expect(out).toContain("wired_high");
+  expect(killed).toBe("");
 });
 
 test("a heavy proc BELOW the runaway size is spared even under danger", () => {

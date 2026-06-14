@@ -36,6 +36,8 @@ Runs every 60 s (launchd). Trips on:
 - **`compressor`** — VM compressor `> HEAVY_ML_COMPRESSOR_DANGER_GB` (default 12 GB), computed at
   the **real 16 K page size** (the cmux sampler/watchdog hardcode 4096 → under-report 4×; flagged
   to the cmuxlayer lead).
+- **`wired_high`** — wired memory `> HEAVY_ML_WIRED_DANGER_GB` (default 22 GB), computed at the real
+  page size. This is alert-only because wired memory is usually GPU/Metal/kernel/driver owned.
 - **`sampler_stale`** — `cmux-ram-sampler` samples.jsonl older than `HEAVY_ML_SAMPLER_STALE_SECONDS`
   (default 900 s) — the Jun-11 silent-death case.
 
@@ -80,6 +82,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.golems.heavy-ml-guar
 | `HEAVY_ML_MUTEX_MAX_SLOTS` | 1 | concurrent heavy-ML procs allowed |
 | `HEAVY_ML_AGG_DANGER_GB` | 24 | aggregate ML footprint danger |
 | `HEAVY_ML_COMPRESSOR_DANGER_GB` | 12 | compressor danger |
+| `HEAVY_ML_WIRED_DANGER_GB` | 22 | wired-memory danger; alerts only, never autokills by itself |
 | `HEAVY_ML_SAMPLER_STALE_SECONDS` | 900 | sampler freshness window |
 | `HEAVY_ML_GUARD_ENABLE_KILL` | **1** | autokill true runaways under danger; `0` = alert-only |
 | `HEAVY_ML_RUNAWAY_GB` | 12 | a non-protected, non-seat proc ≥ this under danger = runaway |
