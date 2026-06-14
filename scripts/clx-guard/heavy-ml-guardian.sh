@@ -178,8 +178,8 @@ stale_embedder_reclaim() {
     [[ -n "$pid" ]] || continue
     # M4: re-read the seat IMMEDIATELY before any kill — a job may have acquired the seat after
     # the first snapshot. Never kill the (now) seated legit job.
-    if [[ "$pid" == "$(seat_holder_pid)" ]]; then
-      log "embedder pid=$pid acquired the seat between samples — SPARED (legit, never break work)"
+    if is_seat_protected "$pid"; then
+      log "embedder pid=$pid is the seat holder / in its group — SPARED (legit, never break work)"
       continue
     fi
     # M2: distinguish "PID gone" (empty row) from a real idle 0.0 — a vanished PID must NOT be
@@ -237,6 +237,23 @@ emit_clx() {
 }
 
 seat_holder_pid() { cat "$RAM_SEAT_HOLD/pid" 2>/dev/null || true; }
+seat_holder_pgid() { cat "$RAM_SEAT_HOLD/pgid" 2>/dev/null || true; }
+proc_pgid() { ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '; }
+
+# True if pid is the seated workload OR a member of its process group. ram-seat.sh records the
+# WORKLOAD child's pid+pgid (not the wrapper), so the heavy proc that shows up in `ps` and its
+# worker subtree are both recognized and spared. Returns 1 (not protected) when no seat is held.
+is_seat_protected() {
+  local pid="$1" spid spgid ppgid
+  spid="$(seat_holder_pid)"
+  [[ -n "$spid" && "$pid" == "$spid" ]] && return 0
+  spgid="$(seat_holder_pgid)"
+  if [[ -n "$spgid" ]]; then
+    ppgid="$(proc_pgid "$pid")"
+    [[ -n "$ppgid" && "$ppgid" == "$spgid" ]] && return 0
+  fi
+  return 1
+}
 
 # Autokill TRUE RUNAWAYS ONLY (Etan: autokill yes, but never legit work, never an
 # unexpected quit). A runaway = a heavy-ML proc that is ALL of:
@@ -266,8 +283,8 @@ autokill_runaways() {
   while IFS=$'\t' read -r pid rss name; do
     [[ -n "$pid" ]] || continue
     # M4: re-read the seat right before the kill — never TERM a job that just acquired it.
-    if [[ "$pid" == "$(seat_holder_pid)" ]]; then
-      log "runaway pid=$pid acquired the seat between snapshot and kill — SPARED (legit)"
+    if is_seat_protected "$pid"; then
+      log "runaway pid=$pid is the seat holder / in its group — SPARED (legit)"
       continue
     fi
     gb="$(awk -v k="$rss" 'BEGIN { printf "%.1f", k / 1048576 }')"
@@ -280,7 +297,7 @@ autokill_runaways() {
   # grace, then KILL any that ignored TERM (re-checking the seat once more, fail-safe)
   sleep "$HEAVY_ML_TERM_GRACE_SECONDS"
   for pid in $survivors; do
-    [[ "$pid" == "$(seat_holder_pid)" ]] && continue
+    is_seat_protected "$pid" && continue
     if "$HEAVY_ML_KILL_BIN" -0 "$pid" 2>/dev/null; then
       log "AUTOKILL pid=$pid survived TERM — KILL"
       "$HEAVY_ML_KILL_BIN" -KILL "$pid" 2>/dev/null || true

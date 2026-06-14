@@ -91,3 +91,27 @@ test("holder-pid reports the live holder (guardian reads this to spare the legit
     execFileSync("bash", [SEAT, "holder-pid"], { env }).toString().trim(),
   ).toBe("4242");
 });
+
+test("run records the WORKLOAD child pid as the seat holder, not the wrapper (cursor HIGH fix)", () => {
+  const dir = seatDir();
+  const out = join(work, `holderpid-${n++}.txt`);
+  const env = { ...process.env, RAM_SEAT_DIR: dir };
+  // inside the workload, $$ is the child's pid; it must equal the recorded holder/pid
+  execFileSync(
+    "bash",
+    [
+      SEAT,
+      "run",
+      "job",
+      "--",
+      "bash",
+      "-c",
+      `echo "child=$$ holder=$(cat ${dir}/holder/pid)" > ${out}`,
+    ],
+    { env },
+  );
+  const m = readFileSync(out, "utf8")
+    .trim()
+    .match(/child=(\d+) holder=(\d+)/)!;
+  expect(m[2]).toBe(m[1]); // holder pid == the workload child's pid (not the wrapper)
+});
