@@ -34,8 +34,16 @@ HEAVY_ML_NOTIFY_URL="${HEAVY_ML_NOTIFY_URL:-http://localhost:3847/notify}"
 HEAVY_ML_NOTIFY_SOURCE="${HEAVY_ML_NOTIFY_SOURCE:-alerts}"
 HEAVY_ML_NOTIFY_PRIORITY="${HEAVY_ML_NOTIFY_PRIORITY:-high}"
 HEAVY_ML_CLX_CLI="${HEAVY_ML_CLX_CLI:-}"                      # e.g. "bun /path/src/clx/cli.ts" — emit local.ram.guard events
-HEAVY_ML_GUARD_ENABLE_KILL="${HEAVY_ML_GUARD_ENABLE_KILL:-0}" # 0 = alert-only (default). 1 = TERM all-but-largest on mutex breach.
+HEAVY_ML_GUARD_ENABLE_KILL="${HEAVY_ML_GUARD_ENABLE_KILL:-1}" # 1 = autokill TRUE runaways only (Etan ruling 2026-06-14). 0 = alert-only.
+HEAVY_ML_RUNAWAY_GB="${HEAVY_ML_RUNAWAY_GB:-12}"             # a non-seat, non-protected proc at/above this RSS, under danger, is a runaway
 HEAVY_ML_KILL_BIN="${HEAVY_ML_KILL_BIN:-kill}"
+HEAVY_ML_TERM_GRACE_SECONDS="${HEAVY_ML_TERM_GRACE_SECONDS:-8}"
+
+# NEVER autokill these — day-to-day holders that must "stay booted" (Etan: nothing quits
+# unexpectedly). Wispr STT, the voice LLM, ollama, and the embedder daemon are protected.
+HEAVY_ML_PROTECTED_PATTERN="${HEAVY_ML_PROTECTED_PATTERN:-whisper-server|mlx_lm\.server|ollama|bge-large|embed}"
+# The RAM-seat holder is the ONE legit heavy job and is never killed (read from ram-seat).
+RAM_SEAT_HOLD="${RAM_SEAT_HOLD:-${TMPDIR:-/tmp}/ram-seat/holder}"
 
 # Process command must match one of these to count as heavy-ML. python is gated by RSS.
 HEAVY_ML_PATTERN="${HEAVY_ML_PATTERN:-llama-server|ollama|whisper-server|[Mm]lx|[Pp]ython}"
@@ -119,15 +127,49 @@ emit_clx() {
   $HEAVY_ML_CLX_CLI emit local.ram.guard "$payload" >/dev/null 2>&1 || log "clx emit failed (degrading loud): $HEAVY_ML_CLX_CLI"
 }
 
-# Opt-in only. TERM all heavy-ML procs except the single largest (keep the biggest job).
-guarded_kill() {
-  local procs="$1"
-  local keep_pid
-  keep_pid="$(printf '%s\n' "$procs" | sort -t$'\t' -k2 -nr | head -1 | cut -f1)"
-  printf '%s\n' "$procs" | while IFS=$'\t' read -r pid rss name; do
-    [[ -n "$pid" && "$pid" != "$keep_pid" ]] || continue
-    log "guarded_kill: TERM $pid ($name, ${rss}KB) — keeping largest pid $keep_pid"
+seat_holder_pid() { cat "$RAM_SEAT_HOLD/pid" 2>/dev/null || true; }
+
+# Autokill TRUE RUNAWAYS ONLY (Etan: autokill yes, but never legit work, never an
+# unexpected quit). A runaway = a heavy-ML proc that is ALL of:
+#   - at/above HEAVY_ML_RUNAWAY_GB (pathologically large), AND
+#   - NOT on the protected list (Wispr/voice/ollama/embedder stay booted), AND
+#   - NOT the RAM-seat holder (the one legit heavy job), AND
+#   - the system is in REAL danger (compressor or aggregate over threshold — passed in).
+# Legit work that uses the seat, and day-to-day holders, are NEVER touched. Every kill is
+# announced (Telegram + clx) — never silent.
+autokill_runaways() {
+  local runaway_kb seat_pid cand pid rss name gb survivors=""
+  runaway_kb="$(awk -v g="$HEAVY_ML_RUNAWAY_GB" 'BEGIN { printf "%.0f", g * 1024 * 1024 }')"
+  seat_pid="$(seat_holder_pid)"
+  cand="$(ps_source | awk -v min="$runaway_kb" -v pat="$HEAVY_ML_PATTERN" -v prot="$HEAVY_ML_PROTECTED_PATTERN" -v seat="${seat_pid:-0}" '
+    {
+      pid = $1; rss = $2; cmd = $0;
+      sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/, "", cmd);
+      if (rss + 0 >= min && cmd ~ pat && cmd !~ prot && pid != seat) {
+        name = cmd; sub(/[[:space:]].*/, "", name);
+        printf "%s\t%s\t%s\n", pid, rss, name;
+      }
+    }')"
+  if [[ -z "$cand" ]]; then
+    log "danger but NO true runaway — every heavy proc is protected or the seat holder. Alert-only, nothing killed (never an unexpected quit)."
+    return 0
+  fi
+  while IFS=$'\t' read -r pid rss name; do
+    [[ -n "$pid" ]] || continue
+    gb="$(awk -v k="$rss" 'BEGIN { printf "%.1f", k / 1048576 }')"
+    log "AUTOKILL runaway pid=$pid name=$name rss=${gb}GB (>=${HEAVY_ML_RUNAWAY_GB}GB, non-protected, non-seat, system in danger) — TERM"
+    notify "autokill-runaway:$name(${gb}GB)" "1" "$gb" "$(vmstat_compressor_gb)"
+    emit_clx "autokill_runaway:pid$pid:$name:${gb}GB" "1" "$gb" "0"
     "$HEAVY_ML_KILL_BIN" -TERM "$pid" 2>/dev/null || true
+    survivors="${survivors}${pid} "
+  done <<<"$cand"
+  # grace, then KILL any that ignored TERM
+  sleep "$HEAVY_ML_TERM_GRACE_SECONDS"
+  for pid in $survivors; do
+    if "$HEAVY_ML_KILL_BIN" -0 "$pid" 2>/dev/null; then
+      log "AUTOKILL pid=$pid survived TERM — KILL"
+      "$HEAVY_ML_KILL_BIN" -KILL "$pid" 2>/dev/null || true
+    fi
   done
 }
 
@@ -154,8 +196,11 @@ run_once() {
     [[ -n "$procs" ]] && { log "heavy-ML procs (pid/rss_kb/name):"; printf '%s\n' "$procs" >&2; }
     notify "$tripped" "$count" "$total_gb" "$comp_gb"
     emit_clx "$tripped" "$count" "$total_gb" "$comp_gb"
-    if [[ "$HEAVY_ML_GUARD_ENABLE_KILL" == "1" && "$tripped" == *heavy_ml_mutex* && -n "$procs" ]]; then
-      guarded_kill "$procs"
+    # Autokill ONLY under REAL memory danger (compressor or aggregate over threshold) — never
+    # on a bare mutex/stale signal. And only TRUE runaways (autokill_runaways protects legit
+    # work + the seat holder + day-to-day daemons).
+    if [[ "$HEAVY_ML_GUARD_ENABLE_KILL" == "1" && ( "$tripped" == *compressor* || "$tripped" == *heavy_ml_aggregate* ) ]]; then
+      autokill_runaways
     fi
   fi
 }
