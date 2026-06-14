@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.golems.heavy-ml-guardian</string>
+
+  <!--
+    Canonical install path = main metacomlayer checkout (valid once merged to master).
+    While running from a feature-branch worktree, bootstrap a copy whose ProgramArguments
+    point at the worktree's scripts/clx-guard/heavy-ml-guardian.sh instead.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/etanheyman/Gits/metacomlayer/scripts/clx-guard/heavy-ml-guardian.sh</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/etanheyman/.bun/bin</string>
+    <key>HEAVY_ML_CLX_CLI</key>
+    <string>/Users/etanheyman/.bun/bin/bun /Users/etanheyman/Gits/metacomlayer/src/clx/cli.ts</string>
+    <key>CLX_SESSION_ID</key>
+    <string>clx-guard</string>
+    <key>HEAVY_ML_GUARD_ENABLE_KILL</key>
+    <string>0</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StartInterval</key>
+  <integer>60</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/etanheyman/Library/Logs/heavy-ml-guardian/guardian.stdout.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/etanheyman/Library/Logs/heavy-ml-guardian/guardian.stderr.log</string>
+</dict>
+</plist>
